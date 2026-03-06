@@ -37,44 +37,45 @@ load_dotenv()
 def _get_raw_env_value(var_name: str, env_file: str = ".env") -> Optional[str]:
     """
     Read variable value from .env file without processing escape sequences.
-    
+
     This is necessary for correct handling of Windows paths where backslashes
     (e.g., D:\\Projects\\file.json) may be incorrectly interpreted
     as escape sequences (\\a -> bell, \\n -> newline, etc.).
-    
+
     Args:
         var_name: Environment variable name
         env_file: Path to .env file (default ".env")
-    
+
     Returns:
         Raw variable value or None if not found
     """
     env_path = Path(env_file)
     if not env_path.exists():
         return None
-    
+
     try:
         # Read file as-is, without interpretation
         content = env_path.read_text(encoding="utf-8")
-        
+
         # Search for variable considering different formats:
         # VAR="value" or VAR='value' or VAR=value
         # Pattern captures value with or without quotes
         pattern = rf'^{re.escape(var_name)}=(["\']?)(.+?)\1\s*$'
-        
+
         for line in content.splitlines():
             line = line.strip()
             if line.startswith("#") or not line:
                 continue
-            
+
             match = re.match(pattern, line)
             if match:
                 # Return value as-is, without processing escape sequences
                 return match.group(2)
     except Exception:
         pass
-    
+
     return None
+
 
 # ==================================================================================================
 # Server Settings
@@ -136,28 +137,38 @@ REGION: str = os.getenv("KIRO_REGION", "us-east-1")
 # Path to credentials file (optional, alternative to .env)
 # Read directly from .env to avoid escape sequence issues on Windows
 # (e.g., \a in path D:\Projects\adolf is interpreted as bell character)
-_raw_creds_file = _get_raw_env_value("KIRO_CREDS_FILE") or os.getenv("KIRO_CREDS_FILE", "")
+_raw_creds_file = _get_raw_env_value("KIRO_CREDS_FILE") or os.getenv(
+    "KIRO_CREDS_FILE", ""
+)
 # Normalize path for cross-platform compatibility
 KIRO_CREDS_FILE: str = str(Path(_raw_creds_file)) if _raw_creds_file else ""
 
 # Path to kiro-cli SQLite database (optional, for AWS SSO OIDC authentication)
 # Default location: ~/.local/share/kiro-cli/data.sqlite3 (Linux/macOS)
 # or ~/.local/share/amazon-q/data.sqlite3 (amazon-q-developer-cli)
-_raw_cli_db_file = _get_raw_env_value("KIRO_CLI_DB_FILE") or os.getenv("KIRO_CLI_DB_FILE", "")
+_raw_cli_db_file = _get_raw_env_value("KIRO_CLI_DB_FILE") or os.getenv(
+    "KIRO_CLI_DB_FILE", ""
+)
 KIRO_CLI_DB_FILE: str = str(Path(_raw_cli_db_file)) if _raw_cli_db_file else ""
 
 # Optional JSON file for the usage dashboard's server-managed account roster.
 # This allows one protected dashboard page to display usage for multiple Kiro
 # accounts without storing gateway API keys in the browser.
-_raw_usage_accounts_file = _get_raw_env_value("KIRO_USAGE_ACCOUNTS_FILE") or os.getenv("KIRO_USAGE_ACCOUNTS_FILE", "")
-KIRO_USAGE_ACCOUNTS_FILE: str = str(Path(_raw_usage_accounts_file)) if _raw_usage_accounts_file else ""
+_raw_usage_accounts_file = _get_raw_env_value("KIRO_USAGE_ACCOUNTS_FILE") or os.getenv(
+    "KIRO_USAGE_ACCOUNTS_FILE", ""
+)
+KIRO_USAGE_ACCOUNTS_FILE: str = (
+    str(Path(_raw_usage_accounts_file)) if _raw_usage_accounts_file else ""
+)
 
 # ==================================================================================================
 # Kiro API URL Templates
 # ==================================================================================================
 
 # URL for token refresh (Kiro Desktop Auth)
-KIRO_REFRESH_URL_TEMPLATE: str = "https://prod.{region}.auth.desktop.kiro.dev/refreshToken"
+KIRO_REFRESH_URL_TEMPLATE: str = (
+    "https://prod.{region}.auth.desktop.kiro.dev/refreshToken"
+)
 
 # URL for token refresh (AWS SSO OIDC - used by kiro-cli)
 AWS_SSO_OIDC_URL_TEMPLATE: str = "https://oidc.{region}.amazonaws.com/token"
@@ -207,7 +218,6 @@ HIDDEN_MODELS: Dict[str, str] = {
     # Claude 3.7 Sonnet - legacy flagship model, still works!
     # Hidden in Kiro API but functional. Great for users who prefer it.
     "claude-3.7-sonnet": "CLAUDE_3_7_SONNET_20250219_V1_0",
-    
     # Add other hidden/experimental models here as discovered.
     # Example: "claude-secret-model": "INTERNAL_SECRET_MODEL_ID",
 }
@@ -289,19 +299,17 @@ DEFAULT_MAX_INPUT_TOKENS: int = 200000
 # Kiro API returns 400 "Improperly formed request" error when tool descriptions
 # in toolSpecification.description are too long.
 #
-# Solution: Tool Documentation Reference Pattern
+# Solution: truncate long descriptions in-place.
 # - If description ≤ limit → keep as is
-# - If description > limit:
-#   * In toolSpecification.description → reference to system prompt:
-#     "[Full documentation in system prompt under '## Tool: {name}']"
-#   * In system prompt, a section "## Tool: {name}" with full description is added
-#
-# The model sees an explicit reference and knows exactly where to find full documentation.
+# - If description > limit → trim to TOOL_DESCRIPTION_MAX_LENGTH and append
+#   a short truncation suffix so the prompt stays clean.
 
 # Maximum length of tool description in characters.
-# Descriptions longer than this limit will be moved to system prompt.
-# Set to 0 to disable (not recommended - will cause Kiro API errors).
-TOOL_DESCRIPTION_MAX_LENGTH: int = int(os.getenv("TOOL_DESCRIPTION_MAX_LENGTH", "10000"))
+# Descriptions longer than this limit will be truncated by the gateway.
+# Set to 0 to disable truncation (not recommended - may cause Kiro API errors).
+TOOL_DESCRIPTION_MAX_LENGTH: int = int(
+    os.getenv("TOOL_DESCRIPTION_MAX_LENGTH", "10000")
+)
 
 # ==================================================================================================
 # Truncation Recovery Settings
@@ -312,8 +320,12 @@ TOOL_DESCRIPTION_MAX_LENGTH: int = int(os.getenv("TOOL_DESCRIPTION_MAX_LENGTH", 
 # - For tool calls: synthetic tool_result with error message
 # - For content: synthetic user message notifying about truncation
 # This helps the model understand and adapt to Kiro API limitations
-# Default: true (enabled)
-TRUNCATION_RECOVERY: bool = os.getenv("TRUNCATION_RECOVERY", "true").lower() in ("true", "1", "yes")
+# Default: false (disabled) for cleaner prompt behavior with strict clients
+TRUNCATION_RECOVERY: bool = os.getenv("TRUNCATION_RECOVERY", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 
 # ==================================================================================================
 # Logging Settings
@@ -324,6 +336,46 @@ TRUNCATION_RECOVERY: bool = os.getenv("TRUNCATION_RECOVERY", "true").lower() in 
 # Default: INFO (recommended for production)
 # Set to DEBUG for detailed troubleshooting
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# ==================================================================================================
+# Exact Response Cache Settings (Redis)
+# ==================================================================================================
+
+# Redis URL for exact non-streaming response cache.
+# Leave empty to disable the cache outside Docker/Compose environments.
+RESPONSE_CACHE_REDIS_URL: str = os.getenv("RESPONSE_CACHE_REDIS_URL", "").strip()
+
+# TTL for exact response cache entries in seconds.
+# Default: 300 seconds (5 minutes)
+RESPONSE_CACHE_TTL_SECONDS: int = int(os.getenv("RESPONSE_CACHE_TTL_SECONDS", "300"))
+
+# Key prefix used for Redis response cache entries.
+RESPONSE_CACHE_KEY_PREFIX: str = os.getenv(
+    "RESPONSE_CACHE_KEY_PREFIX", "kiro-gateway:response-cache"
+)
+
+# Redis URL for Anthropic prompt-cache compatibility tracking.
+# Defaults to RESPONSE_CACHE_REDIS_URL so one Redis instance can back all cache layers.
+PROMPT_CACHE_REDIS_URL: str = os.getenv(
+    "PROMPT_CACHE_REDIS_URL",
+    RESPONSE_CACHE_REDIS_URL,
+).strip()
+
+# Key prefix used for Redis prompt-cache compatibility entries.
+PROMPT_CACHE_KEY_PREFIX: str = os.getenv(
+    "PROMPT_CACHE_KEY_PREFIX", "kiro-gateway:prompt-cache"
+)
+
+# TTL for read-only tool result cache entries in seconds.
+# Default: 300 seconds (5 minutes)
+TOOL_RESULT_CACHE_TTL_SECONDS: int = int(
+    os.getenv("TOOL_RESULT_CACHE_TTL_SECONDS", "300")
+)
+
+# Key prefix used for Redis read-only tool result cache entries.
+TOOL_RESULT_CACHE_KEY_PREFIX: str = os.getenv(
+    "TOOL_RESULT_CACHE_KEY_PREFIX", "kiro-gateway:tool-result-cache"
+)
 
 # ==================================================================================================
 # First Token Timeout Settings (Streaming Retry)
@@ -371,16 +423,17 @@ def _warn_timeout_configuration():
     """
     Print warning if timeout configuration is suboptimal.
     Called at application startup.
-    
+
     FIRST_TOKEN_TIMEOUT should be less than STREAMING_READ_TIMEOUT:
     - FIRST_TOKEN_TIMEOUT: time to wait for model to START responding
     - STREAMING_READ_TIMEOUT: time to wait BETWEEN chunks during streaming
     """
     if FIRST_TOKEN_TIMEOUT >= STREAMING_READ_TIMEOUT:
         import sys
+
         YELLOW = "\033[93m"
         RESET = "\033[0m"
-        
+
         warning_text = f"""
 {YELLOW}⚠️  WARNING: Suboptimal timeout configuration detected.
     
@@ -398,6 +451,7 @@ def _warn_timeout_configuration():
 """
         print(warning_text, file=sys.stderr)
 
+
 # ==================================================================================================
 # Fake Reasoning Settings (Extended Thinking via Tag Injection)
 # ==================================================================================================
@@ -411,10 +465,15 @@ def _warn_timeout_configuration():
 # with <thinking>...</thinking> blocks that we parse and convert to reasoning_content.
 # It works great, but it's a hack - hence "fake" reasoning.
 #
-# Default: true (enabled) - provides premium experience out of the box
-_FAKE_REASONING_RAW: str = os.getenv("FAKE_REASONING", "").lower()
-# Default is True - if env var is not set or empty, enable fake reasoning
-FAKE_REASONING_ENABLED: bool = _FAKE_REASONING_RAW not in ("false", "0", "no", "disabled", "off")
+# Default: false (disabled) to avoid polluting prompts for strict clients
+_FAKE_REASONING_RAW: str = os.getenv("FAKE_REASONING", "false").lower()
+FAKE_REASONING_ENABLED: bool = _FAKE_REASONING_RAW in (
+    "true",
+    "1",
+    "yes",
+    "enabled",
+    "on",
+)
 
 # Maximum thinking length in tokens.
 # This value is injected into the request as <max_thinking_length>{value}</max_thinking_length>
@@ -429,8 +488,15 @@ FAKE_REASONING_MAX_TOKENS: int = int(os.getenv("FAKE_REASONING_MAX_TOKENS", "400
 # - "strip_tags": Remove tags but keep thinking content in regular content
 #
 # Default: "as_reasoning_content"
-_FAKE_REASONING_HANDLING_RAW: str = os.getenv("FAKE_REASONING_HANDLING", "as_reasoning_content").lower()
-if _FAKE_REASONING_HANDLING_RAW in ("as_reasoning_content", "remove", "pass", "strip_tags"):
+_FAKE_REASONING_HANDLING_RAW: str = os.getenv(
+    "FAKE_REASONING_HANDLING", "as_reasoning_content"
+).lower()
+if _FAKE_REASONING_HANDLING_RAW in (
+    "as_reasoning_content",
+    "remove",
+    "pass",
+    "strip_tags",
+):
     FAKE_REASONING_HANDLING: str = _FAKE_REASONING_HANDLING_RAW
 else:
     FAKE_REASONING_HANDLING: str = "as_reasoning_content"
@@ -438,13 +504,20 @@ else:
 # List of opening tags to detect thinking blocks.
 # The parser will look for any of these tags at the start of the response.
 # Order matters - first match wins.
-FAKE_REASONING_OPEN_TAGS: List[str] = ["<thinking>", "<think>", "<reasoning>", "<thought>"]
+FAKE_REASONING_OPEN_TAGS: List[str] = [
+    "<thinking>",
+    "<think>",
+    "<reasoning>",
+    "<thought>",
+]
 
 # Maximum size of initial buffer for tag detection (characters).
 # If no thinking tag is found within this limit, content is treated as regular response.
 # Lower values = faster first token, but may miss tags with leading whitespace.
 # Default: 30 characters (enough for longest tag + some whitespace)
-FAKE_REASONING_INITIAL_BUFFER_SIZE: int = int(os.getenv("FAKE_REASONING_INITIAL_BUFFER_SIZE", "20"))
+FAKE_REASONING_INITIAL_BUFFER_SIZE: int = int(
+    os.getenv("FAKE_REASONING_INITIAL_BUFFER_SIZE", "20")
+)
 
 
 # ==================================================================================================
@@ -474,4 +547,3 @@ def get_kiro_api_host(region: str) -> str:
 def get_kiro_q_host(region: str) -> str:
     """Return Q API host for the specified region."""
     return KIRO_Q_HOST_TEMPLATE.format(region=region)
-

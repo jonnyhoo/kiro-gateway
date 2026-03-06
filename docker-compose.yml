@@ -34,6 +34,13 @@ services:
       - KIRO_REGION=${KIRO_REGION:-us-east-1}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - DEBUG_MODE=${DEBUG_MODE:-off}
+      - RESPONSE_CACHE_REDIS_URL=${RESPONSE_CACHE_REDIS_URL:-redis://redis:6379/0}
+      - RESPONSE_CACHE_TTL_SECONDS=${RESPONSE_CACHE_TTL_SECONDS:-300}
+      - RESPONSE_CACHE_KEY_PREFIX=${RESPONSE_CACHE_KEY_PREFIX:-kiro-gateway:response-cache}
+      - PROMPT_CACHE_REDIS_URL=${PROMPT_CACHE_REDIS_URL:-redis://redis:6379/0}
+      - PROMPT_CACHE_KEY_PREFIX=${PROMPT_CACHE_KEY_PREFIX:-kiro-gateway:prompt-cache}
+      - TOOL_RESULT_CACHE_TTL_SECONDS=${TOOL_RESULT_CACHE_TTL_SECONDS:-300}
+      - TOOL_RESULT_CACHE_KEY_PREFIX=${TOOL_RESULT_CACHE_KEY_PREFIX:-kiro-gateway:tool-result-cache}
       
       # VPN/Proxy settings (for restricted networks)
       - VPN_PROXY_URL=${VPN_PROXY_URL:-}
@@ -55,6 +62,10 @@ services:
       - ./debug_logs:/app/debug_logs
     
     restart: unless-stopped
+
+    depends_on:
+      redis:
+        condition: service_healthy
     
     # Health check
     healthcheck:
@@ -75,6 +86,23 @@ services:
           cpus: '0.5'      # Minimum guaranteed CPU
           memory: 256M     # Minimum guaranteed memory
 
+  redis:
+    image: redis:8-alpine
+    container_name: kiro-gateway-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    volumes:
+      - redis_data:/data
+
 networks:
   default:
     name: kiro-gateway-network
+
+volumes:
+  redis_data:

@@ -26,7 +26,6 @@ Anthropic's Messages API specification.
 Reference: https://docs.anthropic.com/en/api/messages
 """
 
-import time
 from typing import Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, Field
 
@@ -301,6 +300,9 @@ class AnthropicUsage(BaseModel):
 
     input_tokens: int
     output_tokens: int
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    cache_creation: Optional[Dict[str, int]] = None
 
 
 class AnthropicMessagesResponse(BaseModel):

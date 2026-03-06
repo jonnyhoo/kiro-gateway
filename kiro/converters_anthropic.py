@@ -83,7 +83,8 @@ def extract_system_prompt(system: Any) -> str:
     2. List of content blocks: [{"type": "text", "text": "...", "cache_control": {...}}]
 
     The second format is used for prompt caching with cache_control.
-    We extract only the text, ignoring cache_control (not supported by Kiro).
+    We extract only the text for the upstream Kiro payload; cache semantics are
+    handled separately at the Anthropic route layer.
 
     Args:
         system: System prompt in string or list format
@@ -199,8 +200,6 @@ def extract_images_from_tool_results(content: Any) -> List[Dict[str, Any]]:
         logger.debug(f"Extracted {len(images)} image(s) from tool_result content")
 
     return images
-
-    return tool_results
 
 
 def extract_tool_uses_from_anthropic_content(content: Any) -> List[Dict[str, Any]]:
