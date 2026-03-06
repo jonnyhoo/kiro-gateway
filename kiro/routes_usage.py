@@ -246,6 +246,9 @@ USAGE_DASHBOARD_HTML = r"""<!doctype html>
     const LEGACY_KEY = 'kiro_gateway_api_key';
     const AUTO_REFRESH_KEY = 'kiro_usage_auto_refresh';
     const AUTO_REFRESH_MS = 5 * 60 * 1000;
+    const CURRENT_PAGE_PATH = window.location.pathname.replace(/\/+$/, '');
+    const PATH_BASE = CURRENT_PAGE_PATH.endsWith('/usage') ? (CURRENT_PAGE_PATH.slice(0, -'/usage'.length) || '') : '';
+    const CURRENT_GATEWAY_BASE = `${window.location.origin}${PATH_BASE}`;
 
     const accountNameInput = document.getElementById('accountName');
     const accountBaseUrlInput = document.getElementById('accountBaseUrl');
@@ -289,9 +292,10 @@ USAGE_DASHBOARD_HTML = r"""<!doctype html>
 
     function normalizeBaseUrl(rawUrl) {
       const input = (rawUrl || '').trim();
-      if (!input) return window.location.origin;
-      const url = new URL(input, window.location.origin);
-      return url.origin;
+      if (!input) return CURRENT_GATEWAY_BASE;
+      const url = new URL(input, CURRENT_GATEWAY_BASE);
+      const pathname = url.pathname.replace(/\/+$/, '');
+      return `${url.origin}${pathname}`;
     }
 
     function maskKey(key) {
@@ -459,7 +463,7 @@ USAGE_DASHBOARD_HTML = r"""<!doctype html>
 
     function resetForm() {
       accountNameInput.value = '';
-      accountBaseUrlInput.value = window.location.origin;
+      accountBaseUrlInput.value = CURRENT_GATEWAY_BASE;
       accountApiKeyInput.value = '';
       saveAccountBtn.dataset.editId = '';
       saveAccountBtn.textContent = 'Save account';
@@ -488,7 +492,7 @@ USAGE_DASHBOARD_HTML = r"""<!doctype html>
         name,
         baseUrl,
         apiKey,
-        note: baseUrl === window.location.origin ? 'Current gateway' : 'Remote gateway',
+        note: baseUrl === CURRENT_GATEWAY_BASE ? 'Current gateway' : 'Remote gateway',
         data: null,
         error: null,
         lastUpdatedAt: null,
@@ -530,7 +534,7 @@ USAGE_DASHBOARD_HTML = r"""<!doctype html>
     function seedCurrentGateway() {
       const key = localStorage.getItem(LEGACY_KEY) || accountApiKeyInput.value.trim();
       accountNameInput.value = accountNameInput.value || 'Current gateway';
-      accountBaseUrlInput.value = window.location.origin;
+      accountBaseUrlInput.value = CURRENT_GATEWAY_BASE;
       if (key) accountApiKeyInput.value = key;
       accountNameInput.focus();
       updateStatus('Current gateway values prefilled. Add or confirm the API key, then save.', 'ok');
