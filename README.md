@@ -429,7 +429,9 @@ Leave `VPN_PROXY_URL` empty (default) if you don't need proxy support.
 |----------|--------|-------------|
 | `/` | GET | Health check |
 | `/health` | GET | Detailed health check |
+| `/usage` | GET | Multi-account usage dashboard |
 | `/v1/models` | GET | List available models |
+| `/v1/usage` | GET | Kiro subscription and credits usage |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
 | `/v1/messages` | POST | Anthropic Messages API |
 
