@@ -146,6 +146,12 @@ KIRO_CREDS_FILE: str = str(Path(_raw_creds_file)) if _raw_creds_file else ""
 _raw_cli_db_file = _get_raw_env_value("KIRO_CLI_DB_FILE") or os.getenv("KIRO_CLI_DB_FILE", "")
 KIRO_CLI_DB_FILE: str = str(Path(_raw_cli_db_file)) if _raw_cli_db_file else ""
 
+# Optional JSON file for the usage dashboard's server-managed account roster.
+# This allows one protected dashboard page to display usage for multiple Kiro
+# accounts without storing gateway API keys in the browser.
+_raw_usage_accounts_file = _get_raw_env_value("KIRO_USAGE_ACCOUNTS_FILE") or os.getenv("KIRO_USAGE_ACCOUNTS_FILE", "")
+KIRO_USAGE_ACCOUNTS_FILE: str = str(Path(_raw_usage_accounts_file)) if _raw_usage_accounts_file else ""
+
 # ==================================================================================================
 # Kiro API URL Templates
 # ==================================================================================================

@@ -16,7 +16,7 @@ These models represent the GetUsageLimits response used by the Kiro IDE to
 show subscription state, monthly credits, and any bonus/free-trial windows.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Literal
 
 from pydantic import BaseModel, Field
 
@@ -173,3 +173,38 @@ class KiroUsageLimitsResponse(BaseModel):
     user_info: Optional[KiroUserInfo] = Field(default=None, alias="userInfo")
     fetched_at: str
 
+
+class KiroUsageDashboardAccount(BaseModel):
+    """
+    One account card in the server-managed usage dashboard.
+
+    Attributes:
+        account_id: Stable identifier for the configured account.
+        name: Display label shown in the dashboard.
+        auth_source: Credential source type.
+        region: AWS region used for the account.
+        status: Load status for this account.
+        usage: Usage payload when loading succeeded.
+        error: User-facing error message when loading failed.
+    """
+
+    account_id: str
+    name: str
+    auth_source: str
+    region: str
+    status: Literal["ok", "error"]
+    usage: Optional[KiroUsageLimitsResponse] = None
+    error: Optional[str] = None
+
+
+class KiroUsageDashboardResponse(BaseModel):
+    """
+    Aggregated multi-account usage response for the dashboard page.
+
+    Attributes:
+        accounts: Usage cards for all configured accounts.
+        generated_at: ISO-8601 timestamp when the snapshot was built.
+    """
+
+    accounts: List[KiroUsageDashboardAccount]
+    generated_at: str

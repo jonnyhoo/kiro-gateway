@@ -6,7 +6,7 @@ Unit tests for usage endpoints and dashboard UI.
 
 from unittest.mock import AsyncMock, patch
 
-from kiro.models_usage import KiroUsageLimitsResponse
+from kiro.models_usage import KiroUsageDashboardResponse, KiroUsageLimitsResponse
 
 
 class TestUsageRoutes:
@@ -23,9 +23,9 @@ class TestUsageRoutes:
         print(f"Status: {response.status_code}")
         assert response.status_code == 200
         assert "Kiro Usage Dashboard" in response.text
-        assert "/v1/usage" in response.text
+        assert "/v1/usage/all" in response.text
         assert "Tracked accounts" in response.text
-        assert "Save account" in response.text
+        assert "Server-managed roster" in response.text
         assert "Refresh all" in response.text
 
     def test_usage_api_requires_authentication(self, test_client):
@@ -35,6 +35,17 @@ class TestUsageRoutes:
         """
         print("Action: GET /v1/usage without auth...")
         response = test_client.get("/v1/usage")
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code == 401
+
+    def test_usage_dashboard_api_requires_authentication(self, test_client):
+        """
+        What it does: Verifies aggregated dashboard data requires authentication.
+        Purpose: Prevent exposing the server-managed roster without auth.
+        """
+        print("Action: GET /v1/usage/all without auth...")
+        response = test_client.get("/v1/usage/all")
 
         print(f"Status: {response.status_code}")
         assert response.status_code == 401
@@ -90,3 +101,47 @@ class TestUsageRoutes:
         assert response.status_code == 200
         assert response.json()["subscription_info"]["subscription_title"] == "KIRO PRO"
         assert response.json()["usage_breakdown_list"][0]["remaining_usage"] == 750
+
+    def test_usage_dashboard_api_returns_server_managed_accounts(self, test_client, auth_headers):
+        """
+        What it does: Returns aggregated server-managed dashboard accounts.
+        Purpose: Ensure the dashboard can auto-load accounts without browser-stored keys.
+        """
+        print("Setup: Mock usage dashboard fetcher...")
+        dashboard_model = KiroUsageDashboardResponse.model_validate({
+            "accounts": [
+                {
+                    "account_id": "current-gateway",
+                    "name": "Current gateway",
+                    "auth_source": "kiro_desktop",
+                    "region": "us-east-1",
+                    "status": "ok",
+                    "usage": {
+                        "subscriptionInfo": {
+                            "subscriptionTitle": "KIRO PRO",
+                            "type": "Q_DEVELOPER_STANDALONE_PRO",
+                            "overageCapability": "OVERAGE_CAPABLE",
+                            "upgradeCapability": "UPGRADE_CAPABLE",
+                            "subscriptionManagementTarget": "MANAGE",
+                        },
+                        "overageConfiguration": {"overageStatus": "DISABLED"},
+                        "usageBreakdownList": [],
+                        "nextDateReset": "2026-04-01T00:00:00.000Z",
+                        "daysUntilReset": 25,
+                        "userInfo": {"userId": "user-123"},
+                        "fetched_at": "2026-03-06T00:00:00+00:00",
+                    },
+                    "error": None,
+                }
+            ],
+            "generated_at": "2026-03-06T00:00:00+00:00",
+        })
+
+        with patch("kiro.routes_usage.fetch_usage_dashboard", new=AsyncMock(return_value=dashboard_model)):
+            print("Action: GET /v1/usage/all...")
+            response = test_client.get("/v1/usage/all", headers=auth_headers())
+
+        print(f"Status: {response.status_code}, JSON: {response.json()}")
+        assert response.status_code == 200
+        assert response.json()["accounts"][0]["name"] == "Current gateway"
+        assert response.json()["accounts"][0]["usage"]["subscription_info"]["subscription_title"] == "KIRO PRO"

@@ -16,14 +16,21 @@ by the Kiro IDE usage dashboard.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any, Dict, List
 
 import httpx
 from loguru import logger
 
 from kiro.auth import AuthType, KiroAuthManager
-from kiro.models_usage import KiroUsageLimitsResponse
+from kiro.config import KIRO_USAGE_ACCOUNTS_FILE
+from kiro.models_usage import (
+    KiroUsageDashboardAccount,
+    KiroUsageDashboardResponse,
+    KiroUsageLimitsResponse,
+)
 from kiro.utils import get_kiro_headers
 
 
@@ -106,6 +113,120 @@ def _normalize_usage_limits_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     normalized["nextDateReset"] = _normalize_timestamp(normalized.get("nextDateReset"))
     normalized["fetched_at"] = datetime.now(timezone.utc).isoformat()
     return normalized
+
+
+def _load_server_managed_usage_accounts() -> List[Dict[str, Any]]:
+    """
+    Load additional server-managed dashboard accounts from JSON config.
+
+    Returns:
+        List of configured account dictionaries. Returns an empty list when the
+        config file is not configured or does not exist.
+
+    Raises:
+        ValueError: If the config file is malformed.
+    """
+    if not KIRO_USAGE_ACCOUNTS_FILE:
+        return []
+
+    config_path = Path(KIRO_USAGE_ACCOUNTS_FILE).expanduser()
+    if not config_path.exists():
+        logger.warning(f"KIRO_USAGE_ACCOUNTS_FILE not found: {config_path}")
+        return []
+
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Failed to parse usage accounts config: {error}") from error
+
+    if isinstance(payload, dict):
+        payload = payload.get("accounts", [])
+
+    if not isinstance(payload, list):
+        raise ValueError("Usage accounts config must be a JSON array or an object with an 'accounts' array")
+
+    normalized_accounts: List[Dict[str, Any]] = []
+    for index, account in enumerate(payload, start=1):
+        if not isinstance(account, dict):
+            raise ValueError(f"Usage account entry #{index} must be a JSON object")
+
+        name = str(account.get("name") or f"Account {index}").strip()
+        region = str(account.get("region") or "us-east-1").strip()
+        normalized_accounts.append({
+            "account_id": str(account.get("account_id") or f"server-{index}"),
+            "name": name,
+            "region": region,
+            "auth_source": "creds_file" if account.get("creds_file") else "refresh_token" if account.get("refresh_token") else "sqlite_db" if account.get("sqlite_db") else "unknown",
+            "include_email": bool(account.get("include_email", True)),
+            "manager": KiroAuthManager(
+                refresh_token=account.get("refresh_token"),
+                profile_arn=account.get("profile_arn"),
+                region=region,
+                creds_file=account.get("creds_file"),
+                sqlite_db=account.get("sqlite_db"),
+            ),
+        })
+
+    return normalized_accounts
+
+
+async def fetch_usage_dashboard(
+    auth_manager: KiroAuthManager,
+    shared_client: httpx.AsyncClient,
+) -> KiroUsageDashboardResponse:
+    """
+    Fetch usage data for the current account plus optional server-managed extras.
+
+    Args:
+        auth_manager: Primary auth manager from the running gateway.
+        shared_client: Shared async HTTP client from the FastAPI app state.
+
+    Returns:
+        Aggregated dashboard response with one card per account.
+    """
+    account_specs: List[Dict[str, Any]] = [
+        {
+            "account_id": "current-gateway",
+            "name": "Current gateway",
+            "region": auth_manager.region,
+            "auth_source": auth_manager.auth_type.value,
+            "include_email": True,
+            "manager": auth_manager,
+        },
+        *_load_server_managed_usage_accounts(),
+    ]
+
+    accounts: List[KiroUsageDashboardAccount] = []
+    for spec in account_specs:
+        try:
+            usage = await fetch_usage_limits(
+                spec["manager"],
+                shared_client,
+                is_email_required=bool(spec.get("include_email", True)),
+            )
+            accounts.append(KiroUsageDashboardAccount(
+                account_id=spec["account_id"],
+                name=spec["name"],
+                auth_source=spec["auth_source"],
+                region=spec["region"],
+                status="ok",
+                usage=usage,
+            ))
+        except Exception as error:
+            logger.error(f"Failed to fetch usage for {spec['name']}: {error}")
+            accounts.append(KiroUsageDashboardAccount(
+                account_id=spec["account_id"],
+                name=spec["name"],
+                auth_source=spec["auth_source"],
+                region=spec["region"],
+                status="error",
+                error=str(error),
+            ))
+
+    return KiroUsageDashboardResponse(
+        accounts=accounts,
+        generated_at=datetime.now(timezone.utc).isoformat(),
+    )
 
 
 async def fetch_usage_limits(
