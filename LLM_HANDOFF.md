@@ -211,6 +211,7 @@ Do not casually break these:
 
 Read these next:
 
+- `docs/kiro-endpoint-investigation-2026-03-07.md`
 - `docs/autocache-borrow-plan.md`
 - `docs/lynkr-borrow-plan.md`
 - `docs/server-operations.md`
