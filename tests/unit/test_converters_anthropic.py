@@ -1559,13 +1559,20 @@ class TestAnthropicToKiro:
                 result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
 
         print(f"Result: {result}")
+        history = result["conversationState"]["history"]
+        assert len(history) == 2
+        prelude_user = history[0]["userInputMessage"]["content"]
+        prelude_assistant = history[1]["assistantResponseMessage"]["content"]
         current_content = result["conversationState"]["currentMessage"][
             "userInputMessage"
         ]["content"]
+        print(f"Prelude user content: {prelude_user}")
         print(f"Current content: {current_content}")
-        assert "<system_prompt>" in current_content
-        assert "You are a helpful assistant." in current_content
-        assert "</system_prompt>" in current_content
+        assert "<system_prompt>" in prelude_user
+        assert "You are a helpful assistant." in prelude_user
+        assert "</system_prompt>" in prelude_user
+        assert prelude_assistant == "<system_prompt_ack/>"
+        assert current_content == "Hello!"
 
     def test_includes_tools(self):
         """

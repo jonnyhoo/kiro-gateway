@@ -21,6 +21,7 @@ from kiro.streaming_anthropic import (
     stream_kiro_to_anthropic,
     collect_anthropic_response,
     stream_with_first_token_retry_anthropic,
+    StreamingAutoContinuation,
 )
 from kiro.streaming_core import KiroEvent, StreamResult
 
@@ -581,6 +582,68 @@ class TestStreamKiroToAnthropic:
         assert text_joined == "0123456789"
         assert '"stop_reason": "max_tokens"' in message_delta_event
         print("✓ Streaming max_tokens applied locally")
+
+    @pytest.mark.asyncio
+    async def test_streaming_auto_continues_truncated_text_responses(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Continues a truncated text-only stream inside the same SSE response.
+        Goal: Close the plain-text truncation loop without exposing an extra client turn.
+        """
+        print("Setup: Initial truncated stream plus hidden continuation stream...")
+
+        continuation_response = AsyncMock()
+        continuation_response.status_code = 200
+        continuation_response.aclose = AsyncMock()
+
+        async def mock_parse_kiro_stream(response, *args, **kwargs):
+            if response is mock_response:
+                yield KiroEvent(type="content", content="ABCDEF")
+                return
+
+            if response is continuation_response:
+                yield KiroEvent(type="content", content="DEFghi")
+                yield KiroEvent(type="context_usage", context_usage_percentage=10.0)
+                return
+
+            raise AssertionError("Unexpected response object")
+
+        auto_continue_callback = AsyncMock(
+            return_value=StreamingAutoContinuation(response=continuation_response)
+        )
+
+        events = []
+        with patch(
+            "kiro.streaming_anthropic.parse_kiro_stream", mock_parse_kiro_stream
+        ):
+            with patch(
+                "kiro.streaming_anthropic.parse_bracket_tool_calls", return_value=[]
+            ):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response,
+                    "claude-sonnet-4",
+                    mock_model_cache,
+                    mock_auth_manager,
+                    enable_local_text_controls=True,
+                    auto_continue_callback=auto_continue_callback,
+                    max_auto_continuation_rounds=2,
+                ):
+                    events.append(event)
+
+        delta_events = [event for event in events if "content_block_delta" in event]
+        text_joined = "".join(
+            json.loads(event.split("data: ", 1)[1])["delta"].get("text", "")
+            for event in delta_events
+        )
+        message_delta_event = [event for event in events if "message_delta" in event][0]
+
+        assert text_joined == "ABCDEFghi"
+        assert '"stop_reason": "end_turn"' in message_delta_event
+        auto_continue_callback.assert_awaited_once_with("ABCDEF", 1)
+        mock_response.aclose.assert_called()
+        continuation_response.aclose.assert_called()
+        print("✓ Streaming auto-continuation stitched the hidden tail correctly")
 
     @pytest.mark.asyncio
     async def test_streaming_text_controls_are_opt_in_and_do_not_touch_tool_flows(

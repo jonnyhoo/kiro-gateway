@@ -347,6 +347,25 @@ def format_embedded_system_prompt(system_prompt: str) -> str:
     return f"<system_prompt>\n{cleaned}\n</system_prompt>"
 
 
+def inject_system_prompt_prelude(
+    messages: List[UnifiedMessage], embedded_system_prompt: str
+) -> List[UnifiedMessage]:
+    """
+    Carry Anthropic/OpenAI system text as its own synthetic prelude turn.
+
+    Kiro has no native system field. A dedicated prelude keeps the user's real
+    message body clean and avoids blending system text into ordinary user input.
+    """
+    if not embedded_system_prompt:
+        return messages
+
+    return [
+        UnifiedMessage(role="user", content=embedded_system_prompt),
+        UnifiedMessage(role="assistant", content="<system_prompt_ack/>"),
+        *messages,
+    ]
+
+
 def inject_thinking_tags(content: str) -> str:
     """
     Inject fake reasoning tags into content.
@@ -1480,8 +1499,12 @@ def build_kiro_payload(
             ensure_assistant_before_tool_results(messages)
         )
 
+    messages_with_system_prelude = inject_system_prompt_prelude(
+        messages_with_assistants, embedded_system_prompt
+    )
+
     # Merge adjacent messages with the same role
-    merged_messages = merge_adjacent_messages(messages_with_assistants)
+    merged_messages = merge_adjacent_messages(messages_with_system_prelude)
 
     # Ensure first message is from user (Kiro API requirement, fixes issue #60)
     merged_messages = ensure_first_message_is_user(merged_messages)
@@ -1501,22 +1524,11 @@ def build_kiro_payload(
     # Build history (all messages except the last one)
     history_messages = merged_messages[:-1] if len(merged_messages) > 1 else []
 
-    # If there's a system prompt, add it to the first user message in history
-    if embedded_system_prompt and history_messages:
-        first_msg = history_messages[0]
-        if first_msg.role == "user":
-            original_content = extract_text_content(first_msg.content)
-            first_msg.content = f"{embedded_system_prompt}\n\n{original_content}"
-
     history = build_kiro_history(history_messages, model_id)
 
     # Current message (the last one)
     current_message = merged_messages[-1]
     current_content = extract_text_content(current_message.content)
-
-    # If system prompt exists but history is empty - add to current message
-    if embedded_system_prompt and not history:
-        current_content = f"{embedded_system_prompt}\n\n{current_content}"
 
     # If current message is assistant, need to add it to history
     # and create user message "Continue"

@@ -31,8 +31,10 @@ This module formats Kiro events into Anthropic SSE format:
 Reference: https://docs.anthropic.com/en/api/messages-streaming
 """
 
+import inspect
 import json
 import uuid
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, AsyncGenerator, Dict, List, Optional, Any
 
 import httpx
@@ -222,6 +224,23 @@ def _truncate_appended_text_to_token_limit(
     return truncated_text, True
 
 
+def _calculate_text_overlap(existing_text: str, continuation_text: str) -> int:
+    """Find the longest suffix/prefix overlap for stitched continuation text."""
+    max_overlap = min(len(existing_text), len(continuation_text), 512)
+    for overlap in range(max_overlap, 0, -1):
+        if existing_text[-overlap:] == continuation_text[:overlap]:
+            return overlap
+    return 0
+
+
+def _stitch_continued_text(
+    existing_text: str, continuation_text: str
+) -> tuple[str, int]:
+    """Stitch continuation text while dropping duplicated overlap."""
+    overlap = _calculate_text_overlap(existing_text, continuation_text)
+    return existing_text + continuation_text[overlap:], overlap
+
+
 def _plan_stream_text_controls(
     emitted_text: str,
     pending_text: str,
@@ -317,6 +336,25 @@ def _apply_non_streaming_output_controls(
     )
 
 
+@dataclass
+class StreamingAutoContinuation:
+    """Opaque continuation request state for internal streaming recovery."""
+
+    response: httpx.Response
+    request_messages: Optional[list] = None
+
+
+async def _maybe_aclose_response(response: Any) -> None:
+    """Close upstream responses when they expose a close hook."""
+    close_method = getattr(response, "aclose", None)
+    if not callable(close_method):
+        return
+
+    close_result = close_method()
+    if inspect.isawaitable(close_result):
+        await close_result
+
+
 async def stream_kiro_to_anthropic(
     response: httpx.Response,
     model: str,
@@ -329,6 +367,8 @@ async def stream_kiro_to_anthropic(
     requested_max_tokens: Optional[int] = None,
     stop_sequences: Optional[List[str]] = None,
     enable_local_text_controls: bool = False,
+    auto_continue_callback=None,
+    max_auto_continuation_rounds: int = 0,
 ) -> AsyncGenerator[str, None]:
     """
     Generator for converting Kiro stream to Anthropic SSE format.
@@ -384,6 +424,8 @@ async def stream_kiro_to_anthropic(
 
     # Track truncated tool calls for recovery
     truncated_tools: List[Dict[str, Any]] = []
+    current_response = response
+    recovery_round = 0
 
     try:
         # Send message_start event
@@ -405,109 +447,42 @@ async def stream_kiro_to_anthropic(
             },
         )
 
-        async for event in parse_kiro_stream(response, first_token_timeout):
-            if event.type == "content":
-                content = event.content or ""
-                full_content += content
-                pending_text += content
+        while True:
+            segment_is_continuation = recovery_round > 0
+            segment_context_usage_percentage: Optional[float] = None
+            segment_content_buffer = ""
+            segment_added_content = False
 
-                # Close thinking block if it was open and we're now getting regular content
-                if thinking_block_started and thinking_block_index is not None:
-                    yield format_sse_event(
-                        "content_block_stop",
-                        {"type": "content_block_stop", "index": thinking_block_index},
-                    )
-                    thinking_block_started = False
-                    current_block_index += 1
-
-                # Start text block if not started
-                if pending_text and not text_block_started:
-                    text_block_index = current_block_index
-                    yield format_sse_event(
-                        "content_block_start",
-                        {
-                            "type": "content_block_start",
-                            "index": text_block_index,
-                            "content_block": {"type": "text", "text": ""},
-                        },
-                    )
-                    text_block_started = True
-
-                emit_text = pending_text
-                remaining_text = ""
-                stop_reason = None
-                stop_sequence = None
-                if enable_local_text_controls:
-                    (
-                        emit_text,
-                        remaining_text,
-                        stop_reason,
-                        stop_sequence,
-                    ) = _plan_stream_text_controls(
-                        emitted_text=emitted_content,
-                        pending_text=pending_text,
-                        stop_sequences=stop_sequences,
-                        requested_max_tokens=requested_max_tokens,
-                        is_final=False,
-                    )
-
-                if emit_text:
-                    yield format_sse_event(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": text_block_index,
-                            "delta": {"type": "text_delta", "text": emit_text},
-                        },
-                    )
-                    emitted_content += emit_text
-
-                pending_text = remaining_text
-                if stop_reason:
-                    local_stop_reason = stop_reason
-                    local_stop_sequence = stop_sequence
-                    terminated_early = True
-                    break
-
-            elif event.type == "thinking":
-                thinking_content = event.thinking_content or ""
-                full_thinking_content += thinking_content
-
-                # Handle thinking content based on mode
-                if FAKE_REASONING_HANDLING == "as_reasoning_content":
-                    # Use native Anthropic thinking content blocks
-                    if not thinking_block_started:
-                        thinking_block_index = current_block_index
-                        yield format_sse_event(
-                            "content_block_start",
-                            {
-                                "type": "content_block_start",
-                                "index": thinking_block_index,
-                                "content_block": {
-                                    "type": "thinking",
-                                    "thinking": "",
-                                    "signature": thinking_signature,
-                                },
-                            },
+            async for event in parse_kiro_stream(current_response, first_token_timeout):
+                if segment_is_continuation:
+                    if event.type == "content":
+                        segment_content_buffer += event.content or ""
+                    elif (
+                        event.type == "context_usage"
+                        and event.context_usage_percentage is not None
+                    ):
+                        context_usage_percentage = event.context_usage_percentage
+                        segment_context_usage_percentage = (
+                            event.context_usage_percentage
                         )
-                        thinking_block_started = True
-
-                    if thinking_content:
-                        yield format_sse_event(
-                            "content_block_delta",
-                            {
-                                "type": "content_block_delta",
-                                "index": thinking_block_index,
-                                "delta": {
-                                    "type": "thinking_delta",
-                                    "thinking": thinking_content,
-                                },
-                            },
+                    elif event.type == "thinking":
+                        # Hidden continuation thinking should not leak into the
+                        # visible stream or distort output-token accounting.
+                        continue
+                    elif event.type == "tool_use" and event.tool_use:
+                        logger.warning(
+                            "Auto-continuation produced unexpected tool_use; "
+                            "ignoring continuation tool block"
                         )
+                    continue
 
-                elif FAKE_REASONING_HANDLING == "include_as_text":
-                    # Include thinking as regular text content
-                    # Close thinking block if it was open (shouldn't happen in this mode)
+                if event.type == "content":
+                    content = event.content or ""
+                    full_content += content
+                    segment_added_content = segment_added_content or bool(content)
+                    pending_text += content
+
+                    # Close thinking block if it was open and we're now getting regular content
                     if thinking_block_started and thinking_block_index is not None:
                         yield format_sse_event(
                             "content_block_stop",
@@ -520,7 +495,7 @@ async def stream_kiro_to_anthropic(
                         current_block_index += 1
 
                     # Start text block if not started
-                    if not text_block_started:
+                    if pending_text and not text_block_started:
                         text_block_index = current_block_index
                         yield format_sse_event(
                             "content_block_start",
@@ -532,41 +507,25 @@ async def stream_kiro_to_anthropic(
                         )
                         text_block_started = True
 
-                    if thinking_content:
-                        yield format_sse_event(
-                            "content_block_delta",
-                            {
-                                "type": "content_block_delta",
-                                "index": text_block_index,
-                                "delta": {
-                                    "type": "text_delta",
-                                    "text": thinking_content,
-                                },
-                            },
-                        )
-                # For "strip" mode, we just skip the thinking content
-
-            elif event.type == "tool_use" and event.tool_use:
-                if pending_text:
                     emit_text = pending_text
+                    remaining_text = ""
                     stop_reason = None
                     stop_sequence = None
                     if enable_local_text_controls:
-                        emit_text, pending_text, stop_reason, stop_sequence = (
-                            _plan_stream_text_controls(
-                                emitted_text=emitted_content,
-                                pending_text=pending_text,
-                                stop_sequences=stop_sequences,
-                                requested_max_tokens=requested_max_tokens,
-                                is_final=True,
-                            )
+                        (
+                            emit_text,
+                            remaining_text,
+                            stop_reason,
+                            stop_sequence,
+                        ) = _plan_stream_text_controls(
+                            emitted_text=emitted_content,
+                            pending_text=pending_text,
+                            stop_sequences=stop_sequences,
+                            requested_max_tokens=requested_max_tokens,
+                            is_final=False,
                         )
 
-                    if (
-                        emit_text
-                        and text_block_started
-                        and text_block_index is not None
-                    ):
+                    if emit_text:
                         yield format_sse_event(
                             "content_block_delta",
                             {
@@ -577,145 +536,351 @@ async def stream_kiro_to_anthropic(
                         )
                         emitted_content += emit_text
 
-                    pending_text = ""
+                    pending_text = remaining_text
                     if stop_reason:
                         local_stop_reason = stop_reason
                         local_stop_sequence = stop_sequence
                         terminated_early = True
                         break
 
-                # Close thinking block if open
-                if thinking_block_started and thinking_block_index is not None:
-                    yield format_sse_event(
-                        "content_block_stop",
-                        {"type": "content_block_stop", "index": thinking_block_index},
+                elif event.type == "thinking":
+                    thinking_content = event.thinking_content or ""
+                    full_thinking_content += thinking_content
+
+                    # Handle thinking content based on mode
+                    if FAKE_REASONING_HANDLING == "as_reasoning_content":
+                        # Use native Anthropic thinking content blocks
+                        if not thinking_block_started:
+                            thinking_block_index = current_block_index
+                            yield format_sse_event(
+                                "content_block_start",
+                                {
+                                    "type": "content_block_start",
+                                    "index": thinking_block_index,
+                                    "content_block": {
+                                        "type": "thinking",
+                                        "thinking": "",
+                                        "signature": thinking_signature,
+                                    },
+                                },
+                            )
+                            thinking_block_started = True
+
+                        if thinking_content:
+                            yield format_sse_event(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": thinking_block_index,
+                                    "delta": {
+                                        "type": "thinking_delta",
+                                        "thinking": thinking_content,
+                                    },
+                                },
+                            )
+
+                    elif FAKE_REASONING_HANDLING == "include_as_text":
+                        # Include thinking as regular text content
+                        # Close thinking block if it was open (shouldn't happen in this mode)
+                        if thinking_block_started and thinking_block_index is not None:
+                            yield format_sse_event(
+                                "content_block_stop",
+                                {
+                                    "type": "content_block_stop",
+                                    "index": thinking_block_index,
+                                },
+                            )
+                            thinking_block_started = False
+                            current_block_index += 1
+
+                        # Start text block if not started
+                        if not text_block_started:
+                            text_block_index = current_block_index
+                            yield format_sse_event(
+                                "content_block_start",
+                                {
+                                    "type": "content_block_start",
+                                    "index": text_block_index,
+                                    "content_block": {"type": "text", "text": ""},
+                                },
+                            )
+                            text_block_started = True
+
+                        if thinking_content:
+                            yield format_sse_event(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": text_block_index,
+                                    "delta": {
+                                        "type": "text_delta",
+                                        "text": thinking_content,
+                                    },
+                                },
+                            )
+                    # For "strip" mode, we just skip the thinking content
+
+                elif event.type == "tool_use" and event.tool_use:
+                    if pending_text:
+                        emit_text = pending_text
+                        stop_reason = None
+                        stop_sequence = None
+                        if enable_local_text_controls:
+                            emit_text, pending_text, stop_reason, stop_sequence = (
+                                _plan_stream_text_controls(
+                                    emitted_text=emitted_content,
+                                    pending_text=pending_text,
+                                    stop_sequences=stop_sequences,
+                                    requested_max_tokens=requested_max_tokens,
+                                    is_final=True,
+                                )
+                            )
+
+                        if (
+                            emit_text
+                            and text_block_started
+                            and text_block_index is not None
+                        ):
+                            yield format_sse_event(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": text_block_index,
+                                    "delta": {"type": "text_delta", "text": emit_text},
+                                },
+                            )
+                            emitted_content += emit_text
+
+                        pending_text = ""
+                        if stop_reason:
+                            local_stop_reason = stop_reason
+                            local_stop_sequence = stop_sequence
+                            terminated_early = True
+                            break
+
+                    # Close thinking block if open
+                    if thinking_block_started and thinking_block_index is not None:
+                        yield format_sse_event(
+                            "content_block_stop",
+                            {
+                                "type": "content_block_stop",
+                                "index": thinking_block_index,
+                            },
+                        )
+                        thinking_block_started = False
+                        current_block_index += 1
+
+                    # Close text block if open
+                    if text_block_started and text_block_index is not None:
+                        yield format_sse_event(
+                            "content_block_stop",
+                            {"type": "content_block_stop", "index": text_block_index},
+                        )
+                        text_block_started = False
+                        current_block_index += 1
+
+                    tool = event.tool_use
+                    tool_id = tool.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
+                    tool_name = tool.get("function", {}).get("name", "") or tool.get(
+                        "name", ""
                     )
-                    thinking_block_started = False
-                    current_block_index += 1
+                    tool_input = tool.get("function", {}).get(
+                        "arguments", {}
+                    ) or tool.get("input", {})
 
-                # Close text block if open
-                if text_block_started and text_block_index is not None:
-                    yield format_sse_event(
-                        "content_block_stop",
-                        {"type": "content_block_stop", "index": text_block_index},
-                    )
-                    text_block_started = False
-                    current_block_index += 1
+                    # Check if this tool was truncated
+                    if tool.get("_truncation_detected"):
+                        truncated_tools.append(
+                            {
+                                "id": tool_id,
+                                "name": tool_name,
+                                "truncation_info": tool.get("_truncation_info", {}),
+                            }
+                        )
 
-                tool = event.tool_use
-                tool_id = tool.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
-                tool_name = tool.get("function", {}).get("name", "") or tool.get(
-                    "name", ""
-                )
-                tool_input = tool.get("function", {}).get("arguments", {}) or tool.get(
-                    "input", {}
-                )
+                    # Parse arguments if string
+                    if isinstance(tool_input, str):
+                        try:
+                            tool_input = json.loads(tool_input)
+                        except json.JSONDecodeError:
+                            tool_input = {}
 
-                # Check if this tool was truncated
-                if tool.get("_truncation_detected"):
-                    truncated_tools.append(
-                        {
-                            "id": tool_id,
-                            "name": tool_name,
-                            "truncation_info": tool.get("_truncation_info", {}),
-                        }
-                    )
-
-                # Parse arguments if string
-                if isinstance(tool_input, str):
-                    try:
-                        tool_input = json.loads(tool_input)
-                    except json.JSONDecodeError:
-                        tool_input = {}
-
-                # Send tool_use block start
-                yield format_sse_event(
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": current_block_index,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": tool_id,
-                            "name": tool_name,
-                            "input": {},
-                        },
-                    },
-                )
-
-                # Send tool input as delta
-                input_json = json.dumps(tool_input, ensure_ascii=False)
-                yield format_sse_event(
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": current_block_index,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": input_json,
-                        },
-                    },
-                )
-
-                # Close tool block
-                yield format_sse_event(
-                    "content_block_stop",
-                    {"type": "content_block_stop", "index": current_block_index},
-                )
-
-                tool_blocks.append(
-                    {"id": tool_id, "name": tool_name, "input": tool_input}
-                )
-                current_block_index += 1
-
-            elif (
-                event.type == "context_usage"
-                and event.context_usage_percentage is not None
-            ):
-                context_usage_percentage = event.context_usage_percentage
-
-        if pending_text:
-            emit_text = pending_text
-            stop_reason = None
-            stop_sequence = None
-            if enable_local_text_controls:
-                emit_text, pending_text, stop_reason, stop_sequence = (
-                    _plan_stream_text_controls(
-                        emitted_text=emitted_content,
-                        pending_text=pending_text,
-                        stop_sequences=stop_sequences,
-                        requested_max_tokens=requested_max_tokens,
-                        is_final=True,
-                    )
-                )
-
-            if emit_text:
-                if not text_block_started:
-                    text_block_index = current_block_index
+                    # Send tool_use block start
                     yield format_sse_event(
                         "content_block_start",
                         {
                             "type": "content_block_start",
-                            "index": text_block_index,
-                            "content_block": {"type": "text", "text": ""},
+                            "index": current_block_index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": tool_id,
+                                "name": tool_name,
+                                "input": {},
+                            },
                         },
                     )
-                    text_block_started = True
-                yield format_sse_event(
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": text_block_index,
-                        "delta": {"type": "text_delta", "text": emit_text},
-                    },
-                )
-                emitted_content += emit_text
 
-            pending_text = ""
-            if stop_reason:
-                local_stop_reason = stop_reason
-                local_stop_sequence = stop_sequence
-                terminated_early = True
+                    # Send tool input as delta
+                    input_json = json.dumps(tool_input, ensure_ascii=False)
+                    yield format_sse_event(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": current_block_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": input_json,
+                            },
+                        },
+                    )
+
+                    # Close tool block
+                    yield format_sse_event(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": current_block_index},
+                    )
+
+                    tool_blocks.append(
+                        {"id": tool_id, "name": tool_name, "input": tool_input}
+                    )
+                    current_block_index += 1
+
+                elif (
+                    event.type == "context_usage"
+                    and event.context_usage_percentage is not None
+                ):
+                    context_usage_percentage = event.context_usage_percentage
+                    segment_context_usage_percentage = event.context_usage_percentage
+
+            if segment_is_continuation and segment_content_buffer:
+                stitched_content, overlap = _stitch_continued_text(
+                    full_content, segment_content_buffer
+                )
+                continuation_delta = stitched_content[len(full_content) :]
+                full_content = stitched_content
+                pending_text += continuation_delta
+                segment_added_content = bool(continuation_delta)
+                if overlap:
+                    logger.debug(
+                        "Auto-continuation stitched duplicated prefix with "
+                        f"{overlap} overlapping chars"
+                    )
+
+            segment_was_truncated = (
+                not terminated_early
+                and segment_context_usage_percentage is None
+                and segment_added_content
+                and not tool_blocks
+            )
+
+            can_auto_continue = (
+                segment_was_truncated
+                and callable(auto_continue_callback)
+                and recovery_round < max_auto_continuation_rounds
+                and bool(full_content.strip())
+            )
+
+            if can_auto_continue and pending_text:
+                emit_text = pending_text
+                remaining_text = ""
+                if enable_local_text_controls:
+                    (
+                        emit_text,
+                        remaining_text,
+                        _,
+                        _,
+                    ) = _plan_stream_text_controls(
+                        emitted_text=emitted_content,
+                        pending_text=pending_text,
+                        stop_sequences=stop_sequences,
+                        requested_max_tokens=requested_max_tokens,
+                        is_final=False,
+                    )
+
+                if emit_text:
+                    if not text_block_started:
+                        text_block_index = current_block_index
+                        yield format_sse_event(
+                            "content_block_start",
+                            {
+                                "type": "content_block_start",
+                                "index": text_block_index,
+                                "content_block": {"type": "text", "text": ""},
+                            },
+                        )
+                        text_block_started = True
+                    yield format_sse_event(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": text_block_index,
+                            "delta": {"type": "text_delta", "text": emit_text},
+                        },
+                    )
+                    emitted_content += emit_text
+
+                pending_text = remaining_text
+
+            if can_auto_continue:
+                continuation = await auto_continue_callback(
+                    full_content,
+                    recovery_round + 1,
+                )
+                await _maybe_aclose_response(current_response)
+                if continuation is not None:
+                    recovery_round += 1
+                    current_response = continuation.response
+                    logger.info(
+                        "Streaming auto-continuation triggered for truncated "
+                        f"text-only output (round {recovery_round})"
+                    )
+                    continue
+
+            if pending_text:
+                emit_text = pending_text
+                stop_reason = None
+                stop_sequence = None
+                if enable_local_text_controls:
+                    emit_text, pending_text, stop_reason, stop_sequence = (
+                        _plan_stream_text_controls(
+                            emitted_text=emitted_content,
+                            pending_text=pending_text,
+                            stop_sequences=stop_sequences,
+                            requested_max_tokens=requested_max_tokens,
+                            is_final=True,
+                        )
+                    )
+
+                if emit_text:
+                    if not text_block_started:
+                        text_block_index = current_block_index
+                        yield format_sse_event(
+                            "content_block_start",
+                            {
+                                "type": "content_block_start",
+                                "index": text_block_index,
+                                "content_block": {"type": "text", "text": ""},
+                            },
+                        )
+                        text_block_started = True
+                    yield format_sse_event(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": text_block_index,
+                            "delta": {"type": "text_delta", "text": emit_text},
+                        },
+                    )
+                    emitted_content += emit_text
+
+                pending_text = ""
+                if stop_reason:
+                    local_stop_reason = stop_reason
+                    local_stop_sequence = stop_sequence
+                    terminated_early = True
+
+            await _maybe_aclose_response(current_response)
+            break
 
         # Track completion signals for truncation detection
         stream_completed_normally = (
@@ -910,7 +1075,7 @@ async def stream_kiro_to_anthropic(
         raise
     finally:
         try:
-            await response.aclose()
+            await _maybe_aclose_response(current_response)
         except Exception as close_error:
             logger.debug(f"Error closing response: {close_error}")
 

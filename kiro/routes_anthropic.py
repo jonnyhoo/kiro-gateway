@@ -38,6 +38,7 @@ from loguru import logger
 from kiro.config import PROXY_API_KEY
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
+    AnthropicMessage,
 )
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
@@ -58,6 +59,7 @@ from kiro.response_cache import get_anthropic_cache_eligibility
 from kiro.streaming_anthropic import (
     stream_kiro_to_anthropic,
     collect_anthropic_response,
+    StreamingAutoContinuation,
 )
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
@@ -76,6 +78,15 @@ except ImportError:
 anthropic_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 # Also support Authorization: Bearer for compatibility
 auth_header = APIKeyHeader(name="Authorization", auto_error=False)
+
+
+AUTO_TEXT_CONTINUATION_MAX_ROUNDS = 2
+AUTO_TEXT_CONTINUATION_PROMPT = (
+    "<gateway_continuation>"
+    "Continue exactly from where your previous response ended. "
+    "Do not repeat earlier text. Continue the same answer only."
+    "</gateway_continuation>"
+)
 
 
 async def verify_anthropic_api_key(
@@ -233,6 +244,119 @@ def _build_prompt_cache_headers(
     }
 
 
+def _extract_anthropic_response_text(response_payload: dict) -> str:
+    """Extract visible text from an Anthropic response payload."""
+    text_parts: list[str] = []
+    for block in response_payload.get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text_parts.append(block.get("text", ""))
+    return "".join(text_parts)
+
+
+def _extract_anthropic_thinking_text(response_payload: dict) -> str:
+    """Extract thinking content from an Anthropic response payload."""
+    thinking_parts: list[str] = []
+    for block in response_payload.get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "thinking":
+            thinking_parts.append(block.get("thinking", ""))
+    return "".join(thinking_parts)
+
+
+def _response_has_tool_use(response_payload: dict) -> bool:
+    """Return True when the Anthropic response contains tool_use blocks."""
+    return any(
+        isinstance(block, dict) and block.get("type") == "tool_use"
+        for block in response_payload.get("content") or []
+    )
+
+
+def _calculate_text_overlap(existing_text: str, continuation_text: str) -> int:
+    """Find the longest suffix/prefix overlap for stitched continuation text."""
+    max_overlap = min(len(existing_text), len(continuation_text), 512)
+    for overlap in range(max_overlap, 0, -1):
+        if existing_text[-overlap:] == continuation_text[:overlap]:
+            return overlap
+    return 0
+
+
+def _stitch_continued_text(
+    existing_text: str, continuation_text: str
+) -> tuple[str, int]:
+    """Stitch a continued text response while dropping duplicated overlap."""
+    overlap = _calculate_text_overlap(existing_text, continuation_text)
+    return existing_text + continuation_text[overlap:], overlap
+
+
+def _build_text_continuation_request(
+    request_data: AnthropicMessagesRequest, assistant_text: str
+) -> AnthropicMessagesRequest:
+    """Create an internal follow-up request to continue a truncated text response."""
+    continuation_messages = list(request_data.messages)
+    continuation_messages.append(
+        AnthropicMessage(
+            role="assistant", content=[{"type": "text", "text": assistant_text}]
+        )
+    )
+    continuation_messages.append(
+        AnthropicMessage(
+            role="user",
+            content=[{"type": "text", "text": AUTO_TEXT_CONTINUATION_PROMPT}],
+        )
+    )
+    return request_data.model_copy(
+        update={"messages": continuation_messages},
+        deep=True,
+    )
+
+
+def _merge_continued_anthropic_response(
+    base_response: dict,
+    continuation_response: dict,
+    recovery_round: int,
+) -> dict:
+    """Merge a hidden continuation response into the visible Anthropic payload."""
+    merged_response = copy.deepcopy(base_response)
+    base_text = _extract_anthropic_response_text(base_response)
+    continuation_text = _extract_anthropic_response_text(continuation_response)
+    stitched_text, overlap = _stitch_continued_text(base_text, continuation_text)
+
+    merged_content = [
+        copy.deepcopy(block)
+        for block in merged_response.get("content") or []
+        if not (isinstance(block, dict) and block.get("type") == "text")
+    ]
+    if stitched_text:
+        merged_content.append({"type": "text", "text": stitched_text})
+    merged_response["content"] = merged_content
+
+    merged_usage = dict(merged_response.get("usage") or {})
+    continuation_usage = continuation_response.get("usage") or {}
+    merged_usage["input_tokens"] = int(merged_usage.get("input_tokens", 0)) + int(
+        continuation_usage.get("input_tokens", 0)
+    )
+    merged_usage["output_tokens"] = count_tokens(
+        stitched_text + _extract_anthropic_thinking_text(merged_response)
+    )
+    merged_response["usage"] = merged_usage
+
+    continuation_meta = continuation_response.get("_kiro_gateway_meta") or {}
+    merged_response["stop_reason"] = continuation_response.get(
+        "stop_reason", merged_response.get("stop_reason")
+    )
+    merged_response["stop_sequence"] = continuation_response.get("stop_sequence")
+    merged_response["_kiro_gateway_meta"] = {
+        **(merged_response.get("_kiro_gateway_meta") or {}),
+        "content_truncation": (
+            "recovered"
+            if continuation_meta.get("content_truncation") != "detected"
+            else "detected"
+        ),
+        "content_recovery": f"continued:{recovery_round}",
+        "content_recovery_overlap": str(overlap),
+    }
+    return merged_response
+
+
 def _pop_gateway_response_meta(response_payload: Any) -> dict[str, str]:
     """Remove internal gateway metadata before returning an Anthropic response."""
     if not isinstance(response_payload, dict):
@@ -245,6 +369,7 @@ def _pop_gateway_response_meta(response_payload: Any) -> dict[str, str]:
 def _build_local_output_headers(
     *,
     text_controls_enabled: bool,
+    system_transport: str,
     response_meta: Optional[dict[str, str]] = None,
 ) -> dict[str, str]:
     """Build lightweight observability headers for local output controls."""
@@ -256,7 +381,20 @@ def _build_local_output_headers(
         ),
         "x-kiro-gateway-local-stop-control": meta.get("local_stop_control", "none"),
         "x-kiro-gateway-content-truncation": meta.get("content_truncation", "none"),
+        "x-kiro-gateway-content-recovery": meta.get("content_recovery", "none"),
+        "x-kiro-gateway-system-transport": system_transport,
     }
+
+
+async def _maybe_aclose_response(response: Any) -> None:
+    """Close upstream responses when they expose a close hook."""
+    close_method = getattr(response, "aclose", None)
+    if not callable(close_method):
+        return
+
+    close_result = close_method()
+    if inspect.isawaitable(close_result):
+        await close_result
 
 
 def _build_tool_cache_scope(
@@ -364,6 +502,120 @@ def _validate_required_anthropic_tool_choice(
         )
 
 
+async def _collect_anthropic_response_with_auto_continuation(
+    *,
+    request_data: AnthropicMessagesRequest,
+    initial_response: dict,
+    http_client: KiroHttpClient,
+    url: str,
+    model_cache: ModelInfoCache,
+    auth_manager: KiroAuthManager,
+    profile_arn_for_payload: str,
+) -> dict:
+    """Auto-continue truncated plain-text replies without involving the client."""
+    combined_response = initial_response
+    recovery_round = 0
+
+    while recovery_round < AUTO_TEXT_CONTINUATION_MAX_ROUNDS:
+        response_meta = combined_response.get("_kiro_gateway_meta") or {}
+        if response_meta.get("content_truncation") != "detected":
+            break
+        if _response_has_tool_use(combined_response):
+            break
+
+        assistant_text = _extract_anthropic_response_text(combined_response)
+        if not assistant_text.strip():
+            break
+
+        continuation_request = _build_text_continuation_request(
+            request_data, assistant_text
+        )
+        continuation_payload = anthropic_to_kiro(
+            continuation_request,
+            generate_conversation_id(),
+            profile_arn_for_payload,
+        )
+        continuation_response = await http_client.request_with_retry(
+            "POST", url, continuation_payload, stream=True
+        )
+        if continuation_response.status_code != 200:
+            await _maybe_aclose_response(continuation_response)
+            logger.warning(
+                "Auto-continuation aborted because upstream returned "
+                f"HTTP {continuation_response.status_code}"
+            )
+            break
+
+        next_response = await collect_anthropic_response(
+            continuation_response,
+            request_data.model,
+            model_cache,
+            auth_manager,
+            request_messages=[
+                msg.model_dump() for msg in continuation_request.messages
+            ],
+            prompt_cache_usage=None,
+            requested_max_tokens=request_data.max_tokens,
+            stop_sequences=request_data.stop_sequences,
+        )
+        await _maybe_aclose_response(continuation_response)
+
+        continuation_text = _extract_anthropic_response_text(next_response)
+        if not continuation_text.strip():
+            logger.warning("Auto-continuation stopped because no new text was produced")
+            break
+
+        recovery_round += 1
+        combined_response = _merge_continued_anthropic_response(
+            combined_response,
+            next_response,
+            recovery_round=recovery_round,
+        )
+
+        if (combined_response.get("_kiro_gateway_meta") or {}).get(
+            "content_truncation"
+        ) != "detected":
+            break
+
+    return combined_response
+
+
+async def _open_streaming_text_continuation(
+    *,
+    request_data: AnthropicMessagesRequest,
+    assistant_text: str,
+    http_client: KiroHttpClient,
+    url: str,
+    profile_arn_for_payload: str,
+    recovery_round: int,
+) -> Optional[StreamingAutoContinuation]:
+    """Open a hidden follow-up stream to continue truncated plain-text output."""
+    continuation_request = _build_text_continuation_request(
+        request_data, assistant_text
+    )
+    continuation_payload = anthropic_to_kiro(
+        continuation_request,
+        generate_conversation_id(),
+        profile_arn_for_payload,
+    )
+    continuation_response = await http_client.request_with_retry(
+        "POST", url, continuation_payload, stream=True
+    )
+    if continuation_response.status_code != 200:
+        await _maybe_aclose_response(continuation_response)
+        logger.warning(
+            "Streaming auto-continuation aborted on round "
+            f"{recovery_round} because upstream returned HTTP "
+            f"{continuation_response.status_code}"
+        )
+        return None
+
+    return StreamingAutoContinuation(
+        response=continuation_response,
+        request_messages=[msg.model_dump() for msg in continuation_request.messages],
+    )
+
+
 # --- Router ---
 router = APIRouter(tags=["Anthropic API"])
 
@@ -461,7 +713,6 @@ async def messages(
         generate_truncation_tool_result,
         generate_truncation_user_message,
     )
-    from kiro.models_anthropic import AnthropicMessage
 
     modified_messages = []
     tool_results_modified = 0
@@ -586,6 +837,7 @@ async def messages(
     prompt_cache = getattr(request.app.state, "prompt_cache", None)
     tool_result_cache = request.app.state.tool_result_cache
     local_text_controls_enabled = not bool(request_data.tools)
+    system_transport = "history_prelude" if request_data.system else "none"
     cache_status = "bypass"
     request_payload = request_data.model_dump(exclude_none=True)
     tool_cache_scope = _build_tool_cache_scope(request_payload, auth_manager)
@@ -634,6 +886,7 @@ async def messages(
                         }
                         | _build_local_output_headers(
                             text_controls_enabled=local_text_controls_enabled,
+                            system_transport=system_transport,
                             response_meta=response_meta,
                         )
                         | prompt_cache_headers
@@ -768,6 +1021,22 @@ async def messages(
             async def stream_wrapper():
                 streaming_error = None
                 client_disconnected = False
+                auto_continue_callback = None
+
+                if local_text_controls_enabled:
+
+                    async def auto_continue_callback(
+                        assistant_text: str, recovery_round: int
+                    ) -> Optional[StreamingAutoContinuation]:
+                        return await _open_streaming_text_continuation(
+                            request_data=request_data,
+                            assistant_text=assistant_text,
+                            http_client=http_client,
+                            url=url,
+                            profile_arn_for_payload=profile_arn_for_payload,
+                            recovery_round=recovery_round,
+                        )
+
                 try:
                     async for chunk in stream_kiro_to_anthropic(
                         response,
@@ -779,6 +1048,8 @@ async def messages(
                         requested_max_tokens=request_data.max_tokens,
                         stop_sequences=request_data.stop_sequences,
                         enable_local_text_controls=local_text_controls_enabled,
+                        auto_continue_callback=auto_continue_callback,
+                        max_auto_continuation_rounds=AUTO_TEXT_CONTINUATION_MAX_ROUNDS,
                     ):
                         yield chunk
                 except GeneratorExit:
@@ -831,7 +1102,8 @@ async def messages(
                         "x-kiro-gateway-tool-cache": tool_cache_status,
                     }
                     | _build_local_output_headers(
-                        text_controls_enabled=local_text_controls_enabled
+                        text_controls_enabled=local_text_controls_enabled,
+                        system_transport=system_transport,
                     )
                     | prompt_cache_headers
                 ),
@@ -848,6 +1120,17 @@ async def messages(
                 prompt_cache_usage=prompt_cache_usage,
                 requested_max_tokens=request_data.max_tokens,
                 stop_sequences=request_data.stop_sequences,
+            )
+            anthropic_response = (
+                await _collect_anthropic_response_with_auto_continuation(
+                    request_data=request_data,
+                    initial_response=anthropic_response,
+                    http_client=http_client,
+                    url=url,
+                    model_cache=model_cache,
+                    auth_manager=auth_manager,
+                    profile_arn_for_payload=profile_arn_for_payload,
+                )
             )
             anthropic_response = _merge_prompt_cache_usage(
                 anthropic_response, prompt_cache_usage
@@ -879,6 +1162,7 @@ async def messages(
                     }
                     | _build_local_output_headers(
                         text_controls_enabled=local_text_controls_enabled,
+                        system_transport=system_transport,
                         response_meta=response_meta,
                     )
                     | prompt_cache_headers

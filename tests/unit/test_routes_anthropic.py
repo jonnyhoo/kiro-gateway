@@ -1249,7 +1249,8 @@ class TestAnthropicExactResponseCache:
             "_kiro_gateway_meta": {
                 "local_text_controls": "enabled",
                 "local_stop_control": "max_tokens",
-                "content_truncation": "detected",
+                "content_truncation": "none",
+                "content_recovery": "none",
             },
         }
 
@@ -1269,11 +1270,94 @@ class TestAnthropicExactResponseCache:
         assert response.headers["x-kiro-gateway-tool-cache"] == "bypass"
         assert response.headers["x-kiro-gateway-local-text-controls"] == "enabled"
         assert response.headers["x-kiro-gateway-local-stop-control"] == "max_tokens"
-        assert response.headers["x-kiro-gateway-content-truncation"] == "detected"
+        assert response.headers["x-kiro-gateway-content-truncation"] == "none"
+        assert response.headers["x-kiro-gateway-content-recovery"] == "none"
         assert response.json()["id"] == "msg_live"
         assert "_kiro_gateway_meta" not in response.json()
         assert mock_kiro_http_client_class.called
         mock_cache.set_json.assert_awaited_once()
+
+    @patch("kiro.routes_anthropic.collect_anthropic_response", new_callable=AsyncMock)
+    @patch("kiro.routes_anthropic.KiroHttpClient")
+    def test_non_streaming_auto_continues_truncated_text_response(
+        self,
+        mock_kiro_http_client_class,
+        mock_collect_anthropic_response,
+        test_client,
+        valid_proxy_api_key,
+    ):
+        response_cache = MagicMock()
+        response_cache.is_available.return_value = False
+        response_cache.get_json = AsyncMock(return_value=None)
+        response_cache.set_json = AsyncMock(return_value=True)
+        test_client.app.state.response_cache = response_cache
+
+        tool_result_cache = MagicMock()
+        tool_result_cache.hydrate_anthropic_messages = AsyncMock(
+            side_effect=lambda messages, scope=None: (messages, "bypass")
+        )
+        test_client.app.state.tool_result_cache = tool_result_cache
+
+        mock_client_instance = AsyncMock()
+        mock_client_instance.request_with_retry = AsyncMock(
+            side_effect=[Mock(status_code=200), Mock(status_code=200)]
+        )
+        mock_client_instance.close = AsyncMock()
+        mock_client_instance.client = AsyncMock()
+        mock_kiro_http_client_class.return_value = mock_client_instance
+
+        mock_collect_anthropic_response.side_effect = [
+            {
+                "id": "msg_live",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ABCDEF"}],
+                "model": "claude-sonnet-4-5",
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+                "_kiro_gateway_meta": {
+                    "content_truncation": "detected",
+                    "local_stop_control": "none",
+                    "local_text_controls": "enabled",
+                },
+            },
+            {
+                "id": "msg_live_cont",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "DEFghi"}],
+                "model": "claude-sonnet-4-5",
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 7, "output_tokens": 1},
+                "_kiro_gateway_meta": {
+                    "content_truncation": "none",
+                    "local_stop_control": "none",
+                    "local_text_controls": "enabled",
+                },
+            },
+        ]
+
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 4096,
+                "messages": [{"role": "user", "content": "Write a very long answer"}],
+                "stream": False,
+                "system": "System instruction",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.headers["x-kiro-gateway-content-truncation"] == "recovered"
+        assert response.headers["x-kiro-gateway-content-recovery"] == "continued:1"
+        assert response.headers["x-kiro-gateway-system-transport"] == "history_prelude"
+        assert response.json()["content"][0]["text"] == "ABCDEFghi"
+        assert "_kiro_gateway_meta" not in response.json()
+        assert mock_client_instance.request_with_retry.await_count == 2
 
     @patch("kiro.routes_anthropic.collect_anthropic_response", new_callable=AsyncMock)
     @patch("kiro.routes_anthropic.KiroHttpClient")
@@ -1734,6 +1818,8 @@ class TestAnthropicExactResponseCache:
         assert captured_kwargs["requested_max_tokens"] == 123
         assert captured_kwargs["stop_sequences"] == ["STOP"]
         assert captured_kwargs["enable_local_text_controls"] is True
+        assert callable(captured_kwargs["auto_continue_callback"])
+        assert captured_kwargs["max_auto_continuation_rounds"] == 2
         assert response.headers["x-kiro-gateway-local-text-controls"] == "enabled"
 
     @patch("kiro.routes_anthropic.collect_anthropic_response", new_callable=AsyncMock)
