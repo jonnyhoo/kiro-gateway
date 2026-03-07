@@ -646,6 +646,79 @@ class TestStreamKiroToAnthropic:
         print("✓ Streaming auto-continuation stitched the hidden tail correctly")
 
     @pytest.mark.asyncio
+    async def test_streaming_auto_continues_incomplete_code_tail(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Continues a text-only stream when the tail is syntactically incomplete.
+        Goal: Recover long code/text outputs even when upstream reports a normal end_turn.
+        """
+        print("Setup: Incomplete code tail plus hidden continuation stream...")
+
+        continuation_response = AsyncMock()
+        continuation_response.status_code = 200
+        continuation_response.aclose = AsyncMock()
+
+        async def mock_parse_kiro_stream(response, *args, **kwargs):
+            if response is mock_response:
+                yield KiroEvent(
+                    type="content",
+                    content='export const CONST_0171 = "abcdefghijklmnopqrstuvwxyz',
+                )
+                yield KiroEvent(type="context_usage", context_usage_percentage=9.0)
+                return
+
+            if response is continuation_response:
+                yield KiroEvent(
+                    type="content",
+                    content='abcdefghijklmnopqrstuvwxyz0123456789";',
+                )
+                yield KiroEvent(type="context_usage", context_usage_percentage=10.0)
+                return
+
+            raise AssertionError("Unexpected response object")
+
+        auto_continue_callback = AsyncMock(
+            return_value=StreamingAutoContinuation(response=continuation_response)
+        )
+
+        events = []
+        with patch(
+            "kiro.streaming_anthropic.parse_kiro_stream", mock_parse_kiro_stream
+        ):
+            with patch(
+                "kiro.streaming_anthropic.parse_bracket_tool_calls", return_value=[]
+            ):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response,
+                    "claude-sonnet-4",
+                    mock_model_cache,
+                    mock_auth_manager,
+                    enable_local_text_controls=True,
+                    auto_continue_callback=auto_continue_callback,
+                    max_auto_continuation_rounds=2,
+                ):
+                    events.append(event)
+
+        delta_events = [event for event in events if "content_block_delta" in event]
+        text_joined = "".join(
+            json.loads(event.split("data: ", 1)[1])["delta"].get("text", "")
+            for event in delta_events
+        )
+
+        assert (
+            text_joined
+            == 'export const CONST_0171 = "abcdefghijklmnopqrstuvwxyz0123456789";'
+        )
+        auto_continue_callback.assert_awaited_once_with(
+            'export const CONST_0171 = "abcdefghijklmnopqrstuvwxyz',
+            1,
+        )
+        mock_response.aclose.assert_called()
+        continuation_response.aclose.assert_called()
+        print("✓ Streaming auto-continuation recovered the incomplete code tail")
+
+    @pytest.mark.asyncio
     async def test_streaming_text_controls_are_opt_in_and_do_not_touch_tool_flows(
         self, mock_response, mock_model_cache, mock_auth_manager
     ):

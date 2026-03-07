@@ -270,6 +270,72 @@ def _response_has_tool_use(response_payload: dict) -> bool:
     )
 
 
+def _count_unescaped_quotes(text: str, quote: str = '"') -> int:
+    """Count non-escaped quote characters in a string."""
+    count = 0
+    escaped = False
+    for char in text:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == quote:
+            count += 1
+    return count
+
+
+def _text_looks_incomplete_for_continuation(text: str) -> bool:
+    """Detect obviously incomplete plain-text tails worth auto-continuing."""
+    stripped = (text or "").rstrip()
+    if not stripped:
+        return False
+
+    tail = stripped[-1200:]
+    if tail.count("```") % 2 == 1:
+        return True
+    if _count_unescaped_quotes(tail) % 2 == 1:
+        return True
+
+    for opener, closer in (("(", ")"), ("[", "]"), ("{", "}")):
+        if tail.count(opener) > tail.count(closer):
+            return True
+
+    last_line = tail.splitlines()[-1].strip()
+    if not last_line:
+        return False
+
+    if last_line.startswith(
+        (
+            "export ",
+            "import ",
+            "const ",
+            "let ",
+            "var ",
+            "function ",
+            "class ",
+            "interface ",
+            "type ",
+            "enum ",
+        )
+    ) and not last_line.endswith((";", "{", "}", ")", "]")):
+        return True
+
+    return last_line[-1] in {"(", "[", "{", ",", ":", "\\", "+", "-", "*", "/", "="}
+
+
+def _response_looks_incomplete_for_continuation(response_payload: dict) -> bool:
+    """Return True when a text-only response tail appears cut mid-structure."""
+    if _response_has_tool_use(response_payload):
+        return False
+    if response_payload.get("stop_reason") not in {None, "end_turn"}:
+        return False
+    return _text_looks_incomplete_for_continuation(
+        _extract_anthropic_response_text(response_payload)
+    )
+
+
 def _calculate_text_overlap(existing_text: str, continuation_text: str) -> int:
     """Find the longest suffix/prefix overlap for stitched continuation text."""
     max_overlap = min(len(existing_text), len(continuation_text), 512)
@@ -518,7 +584,11 @@ async def _collect_anthropic_response_with_auto_continuation(
 
     while recovery_round < AUTO_TEXT_CONTINUATION_MAX_ROUNDS:
         response_meta = combined_response.get("_kiro_gateway_meta") or {}
-        if response_meta.get("content_truncation") != "detected":
+        if response_meta.get(
+            "content_truncation"
+        ) != "detected" and not _response_looks_incomplete_for_continuation(
+            combined_response
+        ):
             break
         if _response_has_tool_use(combined_response):
             break

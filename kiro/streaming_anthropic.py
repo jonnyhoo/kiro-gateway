@@ -241,6 +241,61 @@ def _stitch_continued_text(
     return existing_text + continuation_text[overlap:], overlap
 
 
+def _count_unescaped_quotes(text: str, quote: str = '"') -> int:
+    """Count non-escaped quote characters in a string."""
+    count = 0
+    escaped = False
+    for char in text:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == quote:
+            count += 1
+    return count
+
+
+def _text_looks_incomplete_for_continuation(text: str) -> bool:
+    """Detect obviously incomplete text tails worth hidden continuation."""
+    stripped = (text or "").rstrip()
+    if not stripped:
+        return False
+
+    tail = stripped[-1200:]
+    if tail.count("```") % 2 == 1:
+        return True
+    if _count_unescaped_quotes(tail) % 2 == 1:
+        return True
+
+    for opener, closer in (("(", ")"), ("[", "]"), ("{", "}")):
+        if tail.count(opener) > tail.count(closer):
+            return True
+
+    last_line = tail.splitlines()[-1].strip()
+    if not last_line:
+        return False
+
+    if last_line.startswith(
+        (
+            "export ",
+            "import ",
+            "const ",
+            "let ",
+            "var ",
+            "function ",
+            "class ",
+            "interface ",
+            "type ",
+            "enum ",
+        )
+    ) and not last_line.endswith((";", "{", "}", ")", "]")):
+        return True
+
+    return last_line[-1] in {"(", "[", "{", ",", ":", "\\", "+", "-", "*", "/", "="}
+
+
 def _plan_stream_text_controls(
     emitted_text: str,
     pending_text: str,
@@ -772,9 +827,13 @@ async def stream_kiro_to_anthropic(
                 and segment_added_content
                 and not tool_blocks
             )
+            segment_looks_incomplete = (
+                not tool_blocks
+                and _text_looks_incomplete_for_continuation(full_content)
+            )
 
             can_auto_continue = (
-                segment_was_truncated
+                (segment_was_truncated or segment_looks_incomplete)
                 and callable(auto_continue_callback)
                 and recovery_round < max_auto_continuation_rounds
                 and bool(full_content.strip())
@@ -831,8 +890,9 @@ async def stream_kiro_to_anthropic(
                     recovery_round += 1
                     current_response = continuation.response
                     logger.info(
-                        "Streaming auto-continuation triggered for truncated "
-                        f"text-only output (round {recovery_round})"
+                        "Streaming auto-continuation triggered for text-only "
+                        f"output (round {recovery_round}, "
+                        f"reason={'truncated' if segment_was_truncated else 'incomplete_tail'})"
                     )
                     continue
 
