@@ -3241,6 +3241,23 @@ class TestConvertToolResultsToKiroFormat:
             print(f"Result {i}: status = {r['status']}")
             assert r["status"] == "success"
 
+    def test_marks_error_tool_result_and_prefixes_content(self):
+        print("Setup: Error tool result...")
+        tool_results = [
+            {
+                "type": "tool_result",
+                "tool_use_id": "call_err",
+                "content": "File not found",
+                "is_error": True,
+            }
+        ]
+
+        print("Action: Converting to Kiro format...")
+        result = convert_tool_results_to_kiro_format(tool_results)
+
+        assert result[0]["status"] == "error"
+        assert result[0]["content"][0]["text"].startswith("[Tool Error]\n")
+
     def test_handles_unicode_content(self):
         """
         What it does: Verifies Unicode content is preserved.

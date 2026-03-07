@@ -678,10 +678,14 @@ def convert_tool_results_to_kiro_format(
         if not content_text:
             content_text = "(empty result)"
 
+        is_error = bool(tr.get("is_error"))
+        if is_error and not content_text.lower().startswith("[tool error]"):
+            content_text = f"[Tool Error]\n{content_text}"
+
         kiro_results.append(
             {
                 "content": [{"text": content_text}],
-                "status": "success",
+                "status": "error" if is_error else "success",
                 "toolUseId": tr.get("tool_use_id", ""),
             }
         )
@@ -711,11 +715,16 @@ def extract_tool_results_from_content(content: Any) -> List[Dict[str, Any]]:
                     {
                         "content": [
                             {
-                                "text": extract_text_content(item.get("content", ""))
-                                or "(empty result)"
+                                "text": (
+                                    ("[Tool Error]\n" if item.get("is_error") else "")
+                                    + (
+                                        extract_text_content(item.get("content", ""))
+                                        or "(empty result)"
+                                    )
+                                )
                             }
                         ],
-                        "status": "success",
+                        "status": "error" if item.get("is_error") else "success",
                         "toolUseId": item.get("tool_use_id", ""),
                     }
                 )

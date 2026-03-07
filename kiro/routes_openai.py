@@ -55,6 +55,7 @@ from kiro.streaming_openai import (
 )
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
+from kiro.streaming_core import ToolCallTruncationError
 
 # Import debug_logger
 try:
@@ -547,6 +548,12 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         if debug_logger:
             debug_logger.flush_on_error(e.status_code, str(e.detail))
         raise
+    except ToolCallTruncationError as e:
+        await http_client.close()
+        logger.error(f"HTTP 502 - POST /v1/chat/completions - {str(e)}")
+        if debug_logger:
+            debug_logger.flush_on_error(502, str(e))
+        raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         await http_client.close()
         logger.error(f"Internal error: {e}", exc_info=True)

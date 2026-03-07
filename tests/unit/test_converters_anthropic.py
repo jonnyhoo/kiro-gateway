@@ -13,7 +13,7 @@ Tests for Anthropic Messages API to Kiro format conversion:
 """
 
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from kiro.converters_anthropic import (
     convert_anthropic_content_to_text,
@@ -24,8 +24,9 @@ from kiro.converters_anthropic import (
     convert_anthropic_messages,
     convert_anthropic_tools,
     anthropic_to_kiro,
+    apply_anthropic_tool_choice_compat,
 )
-from kiro.converters_core import UnifiedMessage, UnifiedTool
+from kiro.converters_core import UnifiedTool
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
     AnthropicMessage,
@@ -596,6 +597,72 @@ class TestExtractToolResultsFromAnthropicContent:
         assert len(result) == 1
         # Text is preserved, images are extracted separately
         assert result[0]["content"] == "Screenshot captured"
+
+    def test_preserves_is_error_flag(self):
+        print("Setup: Tool result with is_error=True...")
+        content = [
+            {
+                "type": "tool_result",
+                "tool_use_id": "call_error",
+                "content": "File not found",
+                "is_error": True,
+            }
+        ]
+
+        print("Action: Extracting tool results...")
+        result = extract_tool_results_from_anthropic_content(content)
+
+        assert len(result) == 1
+        assert result[0]["is_error"] is True
+
+
+class TestApplyAnthropicToolChoiceCompat:
+    def test_filters_specific_tool_and_appends_instruction(self):
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-6",
+            max_tokens=256,
+            tools=[
+                {
+                    "name": "alpha_tool",
+                    "description": "Alpha",
+                    "input_schema": {"type": "object", "properties": {}},
+                },
+                {
+                    "name": "beta_tool",
+                    "description": "Beta",
+                    "input_schema": {"type": "object", "properties": {}},
+                },
+            ],
+            tool_choice={"type": "tool", "name": "beta_tool"},
+            messages=[{"role": "user", "content": "Use the tool."}],
+        )
+
+        updated_request, choice_type = apply_anthropic_tool_choice_compat(request)
+
+        assert choice_type == "tool"
+        assert len(updated_request.tools) == 1
+        assert updated_request.tools[0].name == "beta_tool"
+        assert "must call the tool 'beta_tool'" in extract_system_prompt(
+            updated_request.system
+        )
+
+    def test_raises_for_unknown_tool(self):
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-6",
+            max_tokens=256,
+            tools=[
+                {
+                    "name": "alpha_tool",
+                    "description": "Alpha",
+                    "input_schema": {"type": "object", "properties": {}},
+                }
+            ],
+            tool_choice={"type": "tool", "name": "missing_tool"},
+            messages=[{"role": "user", "content": "Use the tool."}],
+        )
+
+        with pytest.raises(ValueError):
+            apply_anthropic_tool_choice_compat(request)
 
 
 # ==================================================================================================

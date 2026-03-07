@@ -41,7 +41,11 @@ from kiro.models_anthropic import (
 )
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
-from kiro.converters_anthropic import anthropic_to_kiro, extract_system_prompt
+from kiro.converters_anthropic import (
+    anthropic_to_kiro,
+    extract_system_prompt,
+    apply_anthropic_tool_choice_compat,
+)
 from kiro.prompt_cache import (
     build_prompt_cache_usage,
     empty_prompt_cache_evaluation,
@@ -58,6 +62,7 @@ from kiro.streaming_anthropic import (
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.tokenizer import count_message_tokens, count_tokens
+from kiro.streaming_core import ToolCallTruncationError
 
 # Import debug_logger
 try:
@@ -279,6 +284,60 @@ def _build_tool_cache_scope(
     return scope if meaningful_scope else None
 
 
+def _validate_required_anthropic_tool_choice(
+    request_data: AnthropicMessagesRequest, response_payload: dict
+) -> None:
+    """Fail explicitly when required Anthropic tool_choice is not satisfied."""
+    choice = request_data.tool_choice
+    if not choice:
+        return
+
+    if isinstance(choice, dict):
+        choice_type = choice.get("type")
+        choice_name = choice.get("name")
+    else:
+        choice_type = getattr(choice, "type", None)
+        choice_name = getattr(choice, "name", None)
+
+    if choice_type not in {"any", "tool"}:
+        return
+
+    content = response_payload.get("content")
+    tool_blocks = [
+        block
+        for block in content or []
+        if isinstance(block, dict) and block.get("type") == "tool_use"
+    ]
+    if not tool_blocks:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": f"Upstream model ignored required tool_choice ({choice_type}).",
+                },
+            },
+        )
+
+    if choice_type == "tool" and not any(
+        block.get("name") == choice_name for block in tool_blocks
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": (
+                        "Upstream model did not call the required tool_choice "
+                        f"tool '{choice_name}'."
+                    ),
+                },
+            },
+        )
+
+
 # --- Router ---
 router = APIRouter(tags=["Anthropic API"])
 
@@ -478,6 +537,23 @@ async def messages(
         request_data.messages = modified_messages
         logger.info(
             f"Truncation recovery: modified {tool_results_modified} tool_result(s), added {content_notices_added} content notice(s)"
+        )
+
+    try:
+        request_data, tool_choice_mode = apply_anthropic_tool_choice_compat(
+            request_data
+        )
+        if tool_choice_mode in {"any", "tool"}:
+            logger.debug(
+                f"Applied Anthropic tool_choice compatibility mode: {tool_choice_mode}"
+            )
+    except ValueError as e:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": str(e)},
+            },
         )
 
     response_cache = request.app.state.response_cache
@@ -736,6 +812,7 @@ async def messages(
             anthropic_response = _merge_prompt_cache_usage(
                 anthropic_response, prompt_cache_usage
             )
+            _validate_required_anthropic_tool_choice(request_data, anthropic_response)
 
             await http_client.close()
 
@@ -766,6 +843,22 @@ async def messages(
         if debug_logger:
             debug_logger.flush_on_error(e.status_code, str(e.detail))
         raise
+    except ToolCallTruncationError as e:
+        await http_client.close()
+        logger.error(f"HTTP 502 - POST /v1/messages - {str(e)}")
+        if debug_logger:
+            debug_logger.flush_on_error(502, str(e))
+
+        return JSONResponse(
+            status_code=502,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": str(e),
+                },
+            },
+        )
     except Exception as e:
         await http_client.close()
         logger.error(f"Internal error: {e}", exc_info=True)

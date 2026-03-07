@@ -24,7 +24,7 @@ This module is an adapter layer that converts Anthropic-specific formats
 to the unified format used by converters_core.py.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -134,15 +134,18 @@ def extract_tool_results_from_anthropic_content(content: Any) -> List[Dict[str, 
         block_type = None
         tool_use_id = None
         result_content = ""
+        is_error = False
 
         if isinstance(block, dict):
             block_type = block.get("type")
             tool_use_id = block.get("tool_use_id")
             result_content = block.get("content", "")
+            is_error = bool(block.get("is_error"))
         elif hasattr(block, "type"):
             block_type = block.type
             tool_use_id = getattr(block, "tool_use_id", None)
             result_content = getattr(block, "content", "")
+            is_error = bool(getattr(block, "is_error", False))
 
         if block_type == "tool_result" and tool_use_id:
             # Convert content to text if it's a list
@@ -156,6 +159,7 @@ def extract_tool_results_from_anthropic_content(content: Any) -> List[Dict[str, 
                     "type": "tool_result",
                     "tool_use_id": tool_use_id,
                     "content": result_content or "(empty result)",
+                    "is_error": is_error,
                 }
             )
 
@@ -424,3 +428,92 @@ def anthropic_to_kiro(
     )
 
     return result.payload
+
+
+def normalize_anthropic_tool_choice(
+    tool_choice: Any,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Normalize Anthropic tool_choice into ``(type, name)``."""
+    if tool_choice is None:
+        return None, None
+
+    if isinstance(tool_choice, dict):
+        choice_type = tool_choice.get("type")
+        tool_name = tool_choice.get("name")
+    else:
+        choice_type = getattr(tool_choice, "type", None)
+        tool_name = getattr(tool_choice, "name", None)
+
+    if choice_type not in {"auto", "any", "tool"}:
+        return None, None
+
+    return choice_type, tool_name
+
+
+def append_anthropic_system_instruction(system: Any, instruction: str) -> Any:
+    """Append a gateway-authored instruction to the Anthropic system field."""
+    if not instruction:
+        return system
+
+    if system is None:
+        return instruction
+
+    if isinstance(system, str):
+        return f"{system}\n\n{instruction}" if system else instruction
+
+    if isinstance(system, list):
+        updated_system = list(system)
+        updated_system.append({"type": "text", "text": instruction})
+        return updated_system
+
+    extracted = extract_system_prompt(system)
+    return f"{extracted}\n\n{instruction}" if extracted else instruction
+
+
+def apply_anthropic_tool_choice_compat(
+    request: AnthropicMessagesRequest,
+) -> Tuple[AnthropicMessagesRequest, Optional[str]]:
+    """
+    Emulate the useful parts of Anthropic tool_choice for the Kiro upstream.
+
+    - ``tool``: expose only the selected tool and add a must-use instruction
+    - ``any``: keep all tools and add a must-use instruction
+    """
+    if not request.tools or not request.tool_choice:
+        return request, None
+
+    choice_type, tool_name = normalize_anthropic_tool_choice(request.tool_choice)
+    if choice_type is None or choice_type == "auto":
+        return request, choice_type
+
+    updated_tools: List[Any] = list(request.tools)
+    if choice_type == "tool":
+        updated_tools = []
+        for tool in request.tools:
+            current_name = tool.get("name") if isinstance(tool, dict) else tool.name
+            if current_name == tool_name:
+                updated_tools.append(tool)
+                break
+
+        if not updated_tools:
+            raise ValueError(f"tool_choice references unknown tool: {tool_name}")
+
+        instruction = (
+            f"Tool choice requirement: you must call the tool '{tool_name}' before "
+            "answering. Do not ask for clarification and do not answer directly "
+            "without using that tool."
+        )
+    else:
+        instruction = (
+            "Tool choice requirement: you must call at least one of the available "
+            "tools before answering. Do not answer directly without using a tool."
+        )
+
+    updated_request = request.model_copy(
+        update={
+            "tools": updated_tools,
+            "system": append_anthropic_system_instruction(request.system, instruction),
+        },
+        deep=True,
+    )
+    return updated_request, choice_type
