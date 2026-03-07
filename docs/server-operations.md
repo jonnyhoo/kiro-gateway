@@ -3,6 +3,9 @@
 This layout keeps the git worktree clean on the server while making runtime
 state easy to inspect, back up, migrate, and restore.
 
+For a stateless LLM handoff, read [../LLM_HANDOFF.md](../LLM_HANDOFF.md) first.
+That file also defines the required "four-end sync" checks before closing work.
+
 ## Goals
 
 - Keep `/root/kiro-gateway` for tracked code only
