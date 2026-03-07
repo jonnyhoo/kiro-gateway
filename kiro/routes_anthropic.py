@@ -415,16 +415,15 @@ def _merge_continued_anthropic_response(
         "stop_reason", merged_response.get("stop_reason")
     )
     merged_response["stop_sequence"] = continuation_response.get("stop_sequence")
-    merged_response["_kiro_gateway_meta"] = {
+    merged_meta = {
         **(merged_response.get("_kiro_gateway_meta") or {}),
-        "content_truncation": (
-            "recovered"
-            if continuation_meta.get("content_truncation") != "detected"
-            else "detected"
-        ),
         "content_recovery": f"continued:{recovery_round}",
         "content_recovery_overlap": str(overlap),
     }
+    merged_meta.pop("content_truncation", None)
+    if continuation_meta.get("content_truncation") == "detected":
+        merged_meta["content_truncation"] = "detected"
+    merged_response["_kiro_gateway_meta"] = merged_meta
     return merged_response
 
 
@@ -641,6 +640,10 @@ async def _collect_anthropic_response_with_auto_continuation(
             break
 
         recovery_round += 1
+        logger.info(
+            "Non-streaming auto-continuation triggered for text-only "
+            f"output (round {recovery_round})"
+        )
         combined_response = _merge_continued_anthropic_response(
             combined_response,
             next_response,
@@ -651,6 +654,24 @@ async def _collect_anthropic_response_with_auto_continuation(
             "content_truncation"
         ) != "detected":
             break
+
+    if recovery_round > 0:
+        response_meta = dict(combined_response.get("_kiro_gateway_meta") or {})
+        still_incomplete = _response_looks_incomplete_for_continuation(
+            combined_response
+        )
+        still_detected = response_meta.get("content_truncation") == "detected"
+        if still_incomplete or still_detected:
+            response_meta["content_truncation"] = "detected"
+            response_meta["content_recovery"] = f"continued:{recovery_round}:partial"
+            logger.warning(
+                "Non-streaming auto-continuation exhausted without fully "
+                f"closing the text tail after {recovery_round} round(s)"
+            )
+        else:
+            response_meta["content_truncation"] = "recovered"
+            response_meta["content_recovery"] = f"continued:{recovery_round}"
+        combined_response["_kiro_gateway_meta"] = response_meta
 
     return combined_response
 
