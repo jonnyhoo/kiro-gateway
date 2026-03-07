@@ -198,7 +198,7 @@ The gateway automatically detects the authentication type based on the credentia
 
 - **Kiro Desktop Auth** (default): Used when `clientId` and `clientSecret` are NOT present
   - Endpoint: `https://prod.{region}.auth.desktop.kiro.dev/refreshToken`
-  
+
 - **AWS SSO (OIDC)**: Used when `clientId` and `clientSecret` ARE present
   - Endpoint: `https://oidc.{region}.amazonaws.com/token`
 
@@ -277,6 +277,9 @@ docker-compose logs -f
 curl http://localhost:8000/health
 ```
 
+For a clean server deployment where runtime files live outside the git worktree,
+see [docs/server-operations.md](docs/server-operations.md).
+
 ### Docker Run (Without Compose)
 
 <details>
@@ -331,20 +334,25 @@ docker run -d -p 8000:8000 --env-file .env --name kiro-gateway ghcr.io/jwadow/ki
 
 ### Docker Compose Configuration
 
-Edit `docker-compose.yml` and uncomment volume mounts for your OS:
+Prefer setting deployment-specific paths in `.env` instead of editing tracked
+compose files. The compose stack supports:
+
+- `KIRO_GATEWAY_PORT_BIND` for publish address, e.g. `127.0.0.1:8000:8000`
+- `KIRO_GATEWAY_RUNTIME_DIR` for runtime files and backups
+- `KIRO_GATEWAY_REDIS_DATA_DIR` for Redis AOF persistence
+- `KIRO_GATEWAY_SSO_CACHE_DIR` for mounted AWS SSO credentials
+
+See [deploy/server.env.example](deploy/server.env.example) for a ready-to-copy
+server snippet, and [docs/server-operations.md](docs/server-operations.md) for
+backup, restore, and migration steps.
+
+If you still prefer a project-local setup, the default compose values create:
 
 ```yaml
-volumes:
-  # Kiro IDE credentials (choose your OS)
-  - ~/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro              # Linux/macOS
-  # - ${USERPROFILE}/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro  # Windows
-  
-  # kiro-cli database (choose your OS)
-  - ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli:ro  # Linux/macOS
-  # - ${USERPROFILE}/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli:ro  # Windows
-  
-  # Debug logs (optional)
-  - ./debug_logs:/app/debug_logs
+KIRO_GATEWAY_PORT_BIND=8000:8000
+KIRO_GATEWAY_RUNTIME_DIR=./runtime
+KIRO_GATEWAY_REDIS_DATA_DIR=./runtime/redis
+KIRO_GATEWAY_SSO_CACHE_DIR=./deploy/empty-sso-cache
 ```
 
 ### Management Commands

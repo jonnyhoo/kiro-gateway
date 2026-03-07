@@ -1,6 +1,7 @@
 # Environment
 .env
 .env.local
+.proxy_api_key
 
 # IDE
 .vscode/
@@ -20,6 +21,9 @@ build/
 # Debug logs (generated when DEBUG_MODE is enabled)
 debug_logs*/
 debug*.json
+runtime/
+docker-compose.override.yml
+usage-accounts.json
 
 # Project-specific
 _notes/
