@@ -1,6 +1,6 @@
 # LLM Handoff
 
-Last updated: 2026-03-07
+Last updated: 2026-03-08
 
 This file is the shortest reliable handoff for a stateless LLM or operator.
 Read this first before changing deployment or cache behavior.
@@ -61,11 +61,26 @@ The gateway already includes:
 - Non-streaming Anthropic plain-text responses now enforce `max_tokens` locally
 - Streaming Anthropic text-only responses now enforce `stop_sequences` locally
 - Streaming Anthropic text-only responses now enforce `max_tokens` locally
-- Flattened system prompts are now wrapped in `<system_prompt>...</system_prompt>`
+- Anthropic/OpenAI `system` prompts now travel as a synthetic history prelude turn
+- Anthropic plain-text non-streaming responses can auto-continue hidden follow-up
+  rounds when Kiro truncates or ends mid-structure
+- Anthropic plain-text streaming responses can auto-continue hidden follow-up
+  rounds when Kiro truncates or ends mid-structure
 - Anthropic responses now expose local-output telemetry headers:
   `x-kiro-gateway-local-text-controls`
   `x-kiro-gateway-local-stop-control`
   `x-kiro-gateway-content-truncation`
+  `x-kiro-gateway-content-recovery`
+
+Most recent verified sync point:
+
+- local/origin/server/runtime matched at commit `264fa34`
+
+Most recent live endpoint verification on `claude-sonnet-4-6` showed:
+
+- `x-kiro-gateway-system-transport=history_prelude`
+- non-streaming long text recovered through 2 hidden rounds to about 52k chars
+- streaming long text also recovered through 2 hidden rounds to about 52k chars
 
 The deployment layout was then cleaned up so the server git worktree stays clean:
 
@@ -162,6 +177,13 @@ cd E:\VIBE_CODING_WORK\kiro-gateway
 python scripts/ops/probe_anthropic_compat.py --base-url https://api.10010074.xyz/kiro --api-key <key>
 ```
 
+Include the heavier long-text recovery probes:
+
+```bash
+cd E:\VIBE_CODING_WORK\kiro-gateway
+python scripts/ops/probe_anthropic_compat.py --base-url https://api.10010074.xyz/kiro --api-key <key> --include-long-text --long-timeout 240
+```
+
 ## Sync Workflow
 
 Use this when local contains the intended commit:
@@ -227,20 +249,20 @@ Do not casually break these:
 
 ## Remaining Gaps
 
-These were still open after the latest local compatibility pass:
+These are the meaningful remaining gaps now:
 
-- Streaming plain-text truncation is only detected/logged; user-facing handling is
-  still undecided
+- Streaming recovery can happen invisibly, but HTTP headers cannot report whether
+  it actually triggered because headers are sent before the SSE body
 - Anthropic local streaming output controls are intentionally limited to
   text-only requests; tool-enabled requests still bypass them to avoid degrading
   tool use
-- Anthropic `system` is still embedded into user-visible Kiro content because
-  Kiro has no native system field; the gateway now only adds XML boundaries
+- Anthropic `system` is still synthetic transport, not native Kiro `system`,
+  because Kiro has no native system field
 
-## Server Facts Verified On 2026-03-07
+## Server Facts Verified On 2026-03-08
 
 - `/root/kiro-gateway` git worktree is clean
-- server repo and local repo matched at the last full sync check
+- server repo and local repo matched at commit `264fa34`
 - `kiro-gateway` container is healthy
 - `kiro-gateway-redis` container is healthy
 - public `/kiro/health` reverse proxy is healthy
