@@ -35,6 +35,9 @@ import httpx
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_VERSION = "2023-06-01"
+MAX_TOKENS_STRESS_PROMPT = (
+    "Reply exactly with: alpha beta gamma delta epsilon zeta eta theta iota kappa"
+)
 
 
 @dataclass
@@ -178,13 +181,8 @@ async def probe_nonstream_max_tokens(
 ) -> ProbeResult:
     payload = {
         "model": model,
-        "max_tokens": 8,
-        "messages": [
-            {
-                "role": "user",
-                "content": "Repeat the word TOKEN exactly 50 times separated by spaces and nothing else.",
-            }
-        ],
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": MAX_TOKENS_STRESS_PROMPT}],
     }
     response, body = await _post_json(client, base_url, headers, payload)
     if response.status_code != 200 or not isinstance(body, dict):
@@ -197,18 +195,21 @@ async def probe_nonstream_max_tokens(
         )
 
     usage = body.get("usage") or {}
+    text = _extract_text_blocks(body.get("content"))
     ok = (
         body.get("stop_reason") == "max_tokens"
         and response.headers.get("x-kiro-gateway-local-stop-control") == "max_tokens"
         and isinstance(usage.get("output_tokens"), int)
-        and usage.get("output_tokens") <= 8
+        and usage.get("output_tokens") <= 1
+        and bool(text)
+        and text != "alpha beta gamma delta epsilon zeta eta theta iota kappa"
     )
     return ProbeResult(
         name="nonstream_max_tokens",
         ok=ok,
         detail=(
             f"stop_reason={body.get('stop_reason')}, "
-            f"output_tokens={usage.get('output_tokens')}"
+            f"output_tokens={usage.get('output_tokens')}, text={text!r}"
         ),
         status_code=response.status_code,
         response_headers=_interesting_headers(response.headers),
@@ -267,15 +268,17 @@ async def probe_stream_max_tokens(
     payload = {
         "model": model,
         "stream": True,
-        "max_tokens": 8,
-        "messages": [
-            {
-                "role": "user",
-                "content": "Repeat the word TOKEN exactly 50 times separated by spaces and nothing else.",
-            }
-        ],
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": MAX_TOKENS_STRESS_PROMPT}],
     }
     response, events, _ = await _post_stream(client, base_url, headers, payload)
+    text = "".join(
+        event["data"]["delta"].get("text", "")
+        for event in events
+        if event.get("event") == "content_block_delta"
+        and isinstance(event.get("data"), dict)
+        and isinstance(event["data"].get("delta"), dict)
+    )
     message_delta = next(
         (
             event.get("data")
@@ -291,14 +294,16 @@ async def probe_stream_max_tokens(
         response.status_code == 200
         and delta.get("stop_reason") == "max_tokens"
         and isinstance(usage.get("output_tokens"), int)
-        and usage.get("output_tokens") <= 8
+        and usage.get("output_tokens") <= 1
+        and bool(text)
+        and text != "alpha beta gamma delta epsilon zeta eta theta iota kappa"
     )
     return ProbeResult(
         name="stream_max_tokens",
         ok=ok,
         detail=(
             f"stop_reason={delta.get('stop_reason')}, "
-            f"output_tokens={usage.get('output_tokens')}"
+            f"output_tokens={usage.get('output_tokens')}, text={text!r}"
         ),
         status_code=response.status_code,
         response_headers=_interesting_headers(response.headers),
