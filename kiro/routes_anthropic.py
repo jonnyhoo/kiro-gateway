@@ -650,11 +650,6 @@ async def _collect_anthropic_response_with_auto_continuation(
             recovery_round=recovery_round,
         )
 
-        if (combined_response.get("_kiro_gateway_meta") or {}).get(
-            "content_truncation"
-        ) != "detected":
-            break
-
     if recovery_round > 0:
         response_meta = dict(combined_response.get("_kiro_gateway_meta") or {})
         still_incomplete = _response_looks_incomplete_for_continuation(

@@ -1554,9 +1554,9 @@ class TestAnthropicExactResponseCache:
         assert response.status_code == 200
         assert response.headers["x-kiro-gateway-content-truncation"] == "detected"
         assert (
-            response.headers["x-kiro-gateway-content-recovery"] == "continued:1:partial"
+            response.headers["x-kiro-gateway-content-recovery"] == "continued:2:partial"
         )
-        assert mock_client_instance.request_with_retry.await_count == 2
+        assert mock_client_instance.request_with_retry.await_count == 3
 
     @patch("kiro.routes_anthropic.collect_anthropic_response", new_callable=AsyncMock)
     @patch("kiro.routes_anthropic.KiroHttpClient")
