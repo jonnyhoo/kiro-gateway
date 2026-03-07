@@ -233,6 +233,32 @@ def _build_prompt_cache_headers(
     }
 
 
+def _pop_gateway_response_meta(response_payload: Any) -> dict[str, str]:
+    """Remove internal gateway metadata before returning an Anthropic response."""
+    if not isinstance(response_payload, dict):
+        return {}
+
+    meta = response_payload.pop("_kiro_gateway_meta", None)
+    return meta if isinstance(meta, dict) else {}
+
+
+def _build_local_output_headers(
+    *,
+    text_controls_enabled: bool,
+    response_meta: Optional[dict[str, str]] = None,
+) -> dict[str, str]:
+    """Build lightweight observability headers for local output controls."""
+    meta = response_meta or {}
+    default_mode = "enabled" if text_controls_enabled else "bypass_tools"
+    return {
+        "x-kiro-gateway-local-text-controls": meta.get(
+            "local_text_controls", default_mode
+        ),
+        "x-kiro-gateway-local-stop-control": meta.get("local_stop_control", "none"),
+        "x-kiro-gateway-content-truncation": meta.get("content_truncation", "none"),
+    }
+
+
 def _build_tool_cache_scope(
     request_payload: dict, auth_manager: KiroAuthManager
 ) -> Optional[dict[str, str]]:
@@ -559,6 +585,7 @@ async def messages(
     response_cache = request.app.state.response_cache
     prompt_cache = getattr(request.app.state, "prompt_cache", None)
     tool_result_cache = request.app.state.tool_result_cache
+    local_text_controls_enabled = not bool(request_data.tools)
     cache_status = "bypass"
     request_payload = request_data.model_dump(exclude_none=True)
     tool_cache_scope = _build_tool_cache_scope(request_payload, auth_manager)
@@ -597,6 +624,7 @@ async def messages(
                     copy.deepcopy(cached_response),
                     prompt_cache_usage,
                 )
+                response_meta = _pop_gateway_response_meta(cached_response)
                 return JSONResponse(
                     content=cached_response,
                     headers=(
@@ -604,6 +632,10 @@ async def messages(
                             "x-kiro-gateway-cache": "hit",
                             "x-kiro-gateway-tool-cache": tool_cache_status,
                         }
+                        | _build_local_output_headers(
+                            text_controls_enabled=local_text_controls_enabled,
+                            response_meta=response_meta,
+                        )
                         | prompt_cache_headers
                     ),
                 )
@@ -744,6 +776,9 @@ async def messages(
                         auth_manager,
                         request_messages=messages_for_tokenizer,
                         prompt_cache_usage=prompt_cache_usage,
+                        requested_max_tokens=request_data.max_tokens,
+                        stop_sequences=request_data.stop_sequences,
+                        enable_local_text_controls=local_text_controls_enabled,
                     ):
                         yield chunk
                 except GeneratorExit:
@@ -795,6 +830,9 @@ async def messages(
                         "Connection": "keep-alive",
                         "x-kiro-gateway-tool-cache": tool_cache_status,
                     }
+                    | _build_local_output_headers(
+                        text_controls_enabled=local_text_controls_enabled
+                    )
                     | prompt_cache_headers
                 ),
             )
@@ -808,6 +846,8 @@ async def messages(
                 auth_manager,
                 request_messages=messages_for_tokenizer,
                 prompt_cache_usage=prompt_cache_usage,
+                requested_max_tokens=request_data.max_tokens,
+                stop_sequences=request_data.stop_sequences,
             )
             anthropic_response = _merge_prompt_cache_usage(
                 anthropic_response, prompt_cache_usage
@@ -823,8 +863,12 @@ async def messages(
 
             if cache_status == "miss":
                 await response_cache.set_json(
-                    "anthropic-messages", cache_payload, anthropic_response
+                    "anthropic-messages",
+                    cache_payload,
+                    copy.deepcopy(anthropic_response),
                 )
+
+            response_meta = _pop_gateway_response_meta(anthropic_response)
 
             return JSONResponse(
                 content=anthropic_response,
@@ -833,6 +877,10 @@ async def messages(
                         "x-kiro-gateway-cache": cache_status,
                         "x-kiro-gateway-tool-cache": tool_cache_status,
                     }
+                    | _build_local_output_headers(
+                        text_controls_enabled=local_text_controls_enabled,
+                        response_meta=response_meta,
+                    )
                     | prompt_cache_headers
                 ),
             )

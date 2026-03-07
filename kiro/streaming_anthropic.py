@@ -100,6 +100,223 @@ def generate_thinking_signature() -> str:
     return f"sig_{uuid.uuid4().hex[:32]}"
 
 
+def _extract_text_from_blocks(content_blocks: List[Dict[str, Any]]) -> str:
+    """Concatenate Anthropic text blocks into one visible text string."""
+    parts = []
+    for block in content_blocks:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text", ""))
+    return "".join(parts)
+
+
+def _truncate_text_blocks(
+    content_blocks: List[Dict[str, Any]], char_limit: int
+) -> List[Dict[str, Any]]:
+    """Trim Anthropic text blocks to a character boundary while preserving non-text blocks."""
+    truncated_blocks: List[Dict[str, Any]] = []
+    remaining = max(0, char_limit)
+
+    for block in content_blocks:
+        if not isinstance(block, dict) or block.get("type") != "text":
+            truncated_blocks.append(block)
+            continue
+
+        if remaining <= 0:
+            continue
+
+        text = block.get("text", "")
+        if len(text) <= remaining:
+            truncated_blocks.append(block)
+            remaining -= len(text)
+            continue
+
+        updated_block = dict(block)
+        updated_block["text"] = text[:remaining]
+        truncated_blocks.append(updated_block)
+        remaining = 0
+
+    return truncated_blocks
+
+
+def _find_earliest_stop_sequence(
+    text: str, stop_sequences: Optional[List[str]]
+) -> Optional[tuple[int, str]]:
+    """Return the earliest matching stop sequence in visible text."""
+    earliest_match: Optional[tuple[int, str]] = None
+
+    for sequence in stop_sequences or []:
+        if not sequence:
+            continue
+        index = text.find(sequence)
+        if index < 0:
+            continue
+        if earliest_match is None or index < earliest_match[0]:
+            earliest_match = (index, sequence)
+
+    return earliest_match
+
+
+def _truncate_text_to_token_limit(text: str, max_tokens: int) -> tuple[str, bool]:
+    """Trim text to the largest prefix that stays within the requested token budget."""
+    if max_tokens <= 0:
+        return "", bool(text)
+
+    if count_tokens(text) <= max_tokens:
+        return text, False
+
+    low = 0
+    high = len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if count_tokens(text[:mid]) <= max_tokens:
+            low = mid
+        else:
+            high = mid - 1
+
+    truncated_text = text[:low]
+    while truncated_text and count_tokens(truncated_text) > max_tokens:
+        truncated_text = truncated_text[:-1]
+
+    return truncated_text, True
+
+
+def _get_stop_sequence_holdback(stop_sequences: Optional[List[str]]) -> int:
+    """Keep enough trailing chars to detect cross-chunk stop sequences."""
+    non_empty_lengths = [len(sequence) for sequence in stop_sequences or [] if sequence]
+    if not non_empty_lengths:
+        return 0
+    return max(non_empty_lengths) - 1
+
+
+def _truncate_appended_text_to_token_limit(
+    existing_text: str, appended_text: str, max_tokens: Optional[int]
+) -> tuple[str, bool]:
+    """Fit appended text within a total token budget against already-emitted text."""
+    if max_tokens is None:
+        return appended_text, False
+
+    existing_tokens = count_tokens(existing_text)
+    if existing_tokens >= max_tokens:
+        return "", True
+
+    combined_text = existing_text + appended_text
+    combined_tokens = count_tokens(combined_text)
+    if combined_tokens < max_tokens:
+        return appended_text, False
+    if combined_tokens == max_tokens:
+        return appended_text, True
+
+    low = 0
+    high = len(appended_text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if count_tokens(existing_text + appended_text[:mid]) <= max_tokens:
+            low = mid
+        else:
+            high = mid - 1
+
+    truncated_text = appended_text[:low]
+    while truncated_text and count_tokens(existing_text + truncated_text) > max_tokens:
+        truncated_text = truncated_text[:-1]
+
+    return truncated_text, True
+
+
+def _plan_stream_text_controls(
+    emitted_text: str,
+    pending_text: str,
+    stop_sequences: Optional[List[str]],
+    requested_max_tokens: Optional[int],
+    is_final: bool,
+) -> tuple[str, str, Optional[str], Optional[str]]:
+    """
+    Decide how much text can be emitted now and whether the stream should end.
+
+    Returns:
+        (emit_text, remaining_buffer, stop_reason, stop_sequence)
+    """
+    if not pending_text:
+        return "", "", None, None
+
+    stop_match = _find_earliest_stop_sequence(pending_text, stop_sequences)
+    token_limited_text, token_limit_hit = _truncate_appended_text_to_token_limit(
+        emitted_text, pending_text, requested_max_tokens
+    )
+
+    if stop_match and (not token_limit_hit or stop_match[0] <= len(token_limited_text)):
+        return pending_text[: stop_match[0]], "", "stop_sequence", stop_match[1]
+
+    if token_limit_hit:
+        return token_limited_text, "", "max_tokens", None
+
+    safe_emit_length = len(pending_text)
+    if not is_final:
+        safe_emit_length = max(
+            0,
+            len(pending_text) - _get_stop_sequence_holdback(stop_sequences),
+        )
+
+    return (
+        pending_text[:safe_emit_length],
+        pending_text[safe_emit_length:],
+        None,
+        None,
+    )
+
+
+def _apply_non_streaming_output_controls(
+    content_blocks: List[Dict[str, Any]],
+    requested_max_tokens: Optional[int],
+    stop_sequences: Optional[List[str]],
+) -> tuple[List[Dict[str, Any]], Optional[str], Optional[str]]:
+    """
+    Apply Anthropic-compatible response-side controls without touching tool calls.
+
+    Kiro ignores Anthropic stop controls upstream. For plain-text non-streaming
+    responses we can still enforce them locally and keep tool flows untouched.
+    """
+    if any(
+        isinstance(block, dict) and block.get("type") == "tool_use"
+        for block in content_blocks
+    ):
+        return content_blocks, None, None
+
+    visible_text = _extract_text_from_blocks(content_blocks)
+    if not visible_text:
+        return content_blocks, None, None
+
+    stop_match = _find_earliest_stop_sequence(visible_text, stop_sequences)
+    max_token_cut: Optional[int] = None
+
+    if requested_max_tokens is not None:
+        truncated_text, was_truncated = _truncate_text_to_token_limit(
+            visible_text, requested_max_tokens
+        )
+        if was_truncated:
+            max_token_cut = len(truncated_text)
+
+    stop_reason = None
+    stop_sequence = None
+    final_char_limit: Optional[int] = None
+
+    if stop_match and (max_token_cut is None or stop_match[0] <= max_token_cut):
+        final_char_limit = stop_match[0]
+        stop_reason = "stop_sequence"
+        stop_sequence = stop_match[1]
+    elif max_token_cut is not None:
+        final_char_limit = max_token_cut
+        stop_reason = "max_tokens"
+
+    if final_char_limit is None:
+        return content_blocks, None, None
+
+    return (
+        _truncate_text_blocks(content_blocks, final_char_limit),
+        stop_reason,
+        stop_sequence,
+    )
+
+
 async def stream_kiro_to_anthropic(
     response: httpx.Response,
     model: str,
@@ -109,6 +326,9 @@ async def stream_kiro_to_anthropic(
     request_messages: Optional[list] = None,
     conversation_id: Optional[str] = None,
     prompt_cache_usage: Optional[dict] = None,
+    requested_max_tokens: Optional[int] = None,
+    stop_sequences: Optional[List[str]] = None,
+    enable_local_text_controls: bool = False,
 ) -> AsyncGenerator[str, None]:
     """
     Generator for converting Kiro stream to Anthropic SSE format.
@@ -136,6 +356,11 @@ async def stream_kiro_to_anthropic(
     output_tokens = 0
     full_content = ""
     full_thinking_content = ""
+    emitted_content = ""
+    pending_text = ""
+    local_stop_reason: Optional[str] = None
+    local_stop_sequence: Optional[str] = None
+    terminated_early = False
 
     # Count input tokens from request messages
     if request_messages:
@@ -184,6 +409,7 @@ async def stream_kiro_to_anthropic(
             if event.type == "content":
                 content = event.content or ""
                 full_content += content
+                pending_text += content
 
                 # Close thinking block if it was open and we're now getting regular content
                 if thinking_block_started and thinking_block_index is not None:
@@ -195,7 +421,7 @@ async def stream_kiro_to_anthropic(
                     current_block_index += 1
 
                 # Start text block if not started
-                if not text_block_started:
+                if pending_text and not text_block_started:
                     text_block_index = current_block_index
                     yield format_sse_event(
                         "content_block_start",
@@ -207,16 +433,41 @@ async def stream_kiro_to_anthropic(
                     )
                     text_block_started = True
 
-                # Send content delta
-                if content:
+                emit_text = pending_text
+                remaining_text = ""
+                stop_reason = None
+                stop_sequence = None
+                if enable_local_text_controls:
+                    (
+                        emit_text,
+                        remaining_text,
+                        stop_reason,
+                        stop_sequence,
+                    ) = _plan_stream_text_controls(
+                        emitted_text=emitted_content,
+                        pending_text=pending_text,
+                        stop_sequences=stop_sequences,
+                        requested_max_tokens=requested_max_tokens,
+                        is_final=False,
+                    )
+
+                if emit_text:
                     yield format_sse_event(
                         "content_block_delta",
                         {
                             "type": "content_block_delta",
                             "index": text_block_index,
-                            "delta": {"type": "text_delta", "text": content},
+                            "delta": {"type": "text_delta", "text": emit_text},
                         },
                     )
+                    emitted_content += emit_text
+
+                pending_text = remaining_text
+                if stop_reason:
+                    local_stop_reason = stop_reason
+                    local_stop_sequence = stop_sequence
+                    terminated_early = True
+                    break
 
             elif event.type == "thinking":
                 thinking_content = event.thinking_content or ""
@@ -296,6 +547,43 @@ async def stream_kiro_to_anthropic(
                 # For "strip" mode, we just skip the thinking content
 
             elif event.type == "tool_use" and event.tool_use:
+                if pending_text:
+                    emit_text = pending_text
+                    stop_reason = None
+                    stop_sequence = None
+                    if enable_local_text_controls:
+                        emit_text, pending_text, stop_reason, stop_sequence = (
+                            _plan_stream_text_controls(
+                                emitted_text=emitted_content,
+                                pending_text=pending_text,
+                                stop_sequences=stop_sequences,
+                                requested_max_tokens=requested_max_tokens,
+                                is_final=True,
+                            )
+                        )
+
+                    if (
+                        emit_text
+                        and text_block_started
+                        and text_block_index is not None
+                    ):
+                        yield format_sse_event(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": text_block_index,
+                                "delta": {"type": "text_delta", "text": emit_text},
+                            },
+                        )
+                        emitted_content += emit_text
+
+                    pending_text = ""
+                    if stop_reason:
+                        local_stop_reason = stop_reason
+                        local_stop_sequence = stop_sequence
+                        terminated_early = True
+                        break
+
                 # Close thinking block if open
                 if thinking_block_started and thinking_block_index is not None:
                     yield format_sse_event(
@@ -386,11 +674,58 @@ async def stream_kiro_to_anthropic(
             ):
                 context_usage_percentage = event.context_usage_percentage
 
+        if pending_text:
+            emit_text = pending_text
+            stop_reason = None
+            stop_sequence = None
+            if enable_local_text_controls:
+                emit_text, pending_text, stop_reason, stop_sequence = (
+                    _plan_stream_text_controls(
+                        emitted_text=emitted_content,
+                        pending_text=pending_text,
+                        stop_sequences=stop_sequences,
+                        requested_max_tokens=requested_max_tokens,
+                        is_final=True,
+                    )
+                )
+
+            if emit_text:
+                if not text_block_started:
+                    text_block_index = current_block_index
+                    yield format_sse_event(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": text_block_index,
+                            "content_block": {"type": "text", "text": ""},
+                        },
+                    )
+                    text_block_started = True
+                yield format_sse_event(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": text_block_index,
+                        "delta": {"type": "text_delta", "text": emit_text},
+                    },
+                )
+                emitted_content += emit_text
+
+            pending_text = ""
+            if stop_reason:
+                local_stop_reason = stop_reason
+                local_stop_sequence = stop_sequence
+                terminated_early = True
+
         # Track completion signals for truncation detection
-        stream_completed_normally = context_usage_percentage is not None
+        stream_completed_normally = (
+            context_usage_percentage is not None or terminated_early
+        )
 
         # Check for bracket-style tool calls in full content
-        bracket_tool_calls = parse_bracket_tool_calls(full_content)
+        bracket_tool_calls = (
+            [] if terminated_early else parse_bracket_tool_calls(full_content)
+        )
         if bracket_tool_calls:
             # Close thinking block if open
             if thinking_block_started and thinking_block_index is not None:
@@ -490,7 +825,7 @@ async def stream_kiro_to_anthropic(
             )
 
         # Calculate output tokens
-        output_tokens = count_tokens(full_content + full_thinking_content)
+        output_tokens = count_tokens(emitted_content + full_thinking_content)
 
         # Calculate total tokens from context usage if available
         if context_usage_percentage is not None:
@@ -500,14 +835,17 @@ async def stream_kiro_to_anthropic(
             input_tokens = prompt_tokens
 
         # Determine stop reason
-        stop_reason = "tool_use" if tool_blocks else "end_turn"
+        stop_reason = local_stop_reason or ("tool_use" if tool_blocks else "end_turn")
 
         # Send message_delta with stop_reason and usage
         yield format_sse_event(
             "message_delta",
             {
                 "type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "delta": {
+                    "stop_reason": stop_reason,
+                    "stop_sequence": local_stop_sequence,
+                },
                 "usage": {"output_tokens": output_tokens},
             },
         )
@@ -584,6 +922,8 @@ async def collect_anthropic_response(
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
     prompt_cache_usage: Optional[dict] = None,
+    requested_max_tokens: Optional[int] = None,
+    stop_sequences: Optional[List[str]] = None,
 ) -> dict:
     """
     Collect full response from Kiro stream in Anthropic format.
@@ -650,8 +990,26 @@ async def collect_anthropic_response(
             {"type": "tool_use", "id": tool_id, "name": tool_name, "input": tool_input}
         )
 
-    # Calculate output tokens
-    output_tokens = count_tokens(result.content + result.thinking_content)
+    stop_reason = "tool_use" if result.tool_calls else "end_turn"
+    stop_sequence = None
+
+    (
+        content_blocks,
+        constrained_stop_reason,
+        constrained_stop_sequence,
+    ) = _apply_non_streaming_output_controls(
+        content_blocks,
+        requested_max_tokens=requested_max_tokens,
+        stop_sequences=stop_sequences,
+    )
+    if constrained_stop_reason:
+        stop_reason = constrained_stop_reason
+        stop_sequence = constrained_stop_sequence
+
+    visible_text = _extract_text_from_blocks(content_blocks)
+
+    # Calculate output tokens after local Anthropic-compatible post-processing.
+    output_tokens = count_tokens(visible_text + result.thinking_content)
 
     # Calculate from context usage if available
     if result.context_usage_percentage is not None:
@@ -659,9 +1017,6 @@ async def collect_anthropic_response(
             result.context_usage_percentage, output_tokens, model_cache, model
         )
         input_tokens = prompt_tokens
-
-    # Determine stop reason
-    stop_reason = "tool_use" if result.tool_calls else "end_turn"
 
     logger.debug(
         f"[Anthropic Non-Streaming] Completed: "
@@ -676,9 +1031,16 @@ async def collect_anthropic_response(
         "content": content_blocks,
         "model": model,
         "stop_reason": stop_reason,
-        "stop_sequence": None,
+        "stop_sequence": stop_sequence,
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
         | (prompt_cache_usage or {}),
+        "_kiro_gateway_meta": {
+            "content_truncation": (
+                "detected" if result.content_was_truncated else "none"
+            ),
+            "local_stop_control": constrained_stop_reason or "none",
+            "local_text_controls": ("bypass_tools" if result.tool_calls else "enabled"),
+        },
     }
 
 

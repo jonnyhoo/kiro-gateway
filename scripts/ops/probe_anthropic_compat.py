@@ -1,0 +1,430 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Live Anthropic-compatibility probe for kiro-gateway.
+
+This script hits a real gateway endpoint and validates the compatibility
+behaviors that matter for Claude Code style clients:
+
+- non-streaming stop_sequences on text-only replies
+- non-streaming max_tokens on text-only replies
+- streaming stop_sequences on text-only replies
+- streaming max_tokens on text-only replies
+- local text controls bypass when tools are present
+- gateway telemetry headers for local output controls
+
+Usage:
+    python scripts/ops/probe_anthropic_compat.py \
+        --base-url https://api.example.com/kiro \
+        --api-key xxx
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+import httpx
+
+
+DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_VERSION = "2023-06-01"
+
+
+@dataclass
+class ProbeResult:
+    name: str
+    ok: bool
+    detail: str
+    status_code: Optional[int] = None
+    response_headers: Optional[Dict[str, str]] = None
+
+
+def _normalize_base_url(base_url: str) -> str:
+    return base_url.rstrip("/")
+
+
+def _build_headers(api_key: str) -> Dict[str, str]:
+    return {
+        "x-api-key": api_key,
+        "anthropic-version": DEFAULT_VERSION,
+        "content-type": "application/json",
+    }
+
+
+def _extract_text_blocks(content: Any) -> str:
+    parts: List[str] = []
+    if not isinstance(content, list):
+        return ""
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text", ""))
+    return "".join(parts)
+
+
+def _interesting_headers(headers: httpx.Headers) -> Dict[str, str]:
+    prefixes = (
+        "x-kiro-gateway-",
+        "anthropic-version",
+    )
+    return {
+        key: value for key, value in headers.items() if key.lower().startswith(prefixes)
+    }
+
+
+def _parse_sse_events(raw_text: str) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    for chunk in raw_text.split("\n\n"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        event_type = "message"
+        data_lines: List[str] = []
+        for line in chunk.splitlines():
+            if line.startswith("event: "):
+                event_type = line[7:].strip()
+            elif line.startswith("data: "):
+                data_lines.append(line[6:])
+        payload: Any
+        if data_lines:
+            joined = "\n".join(data_lines)
+            try:
+                payload = json.loads(joined)
+            except json.JSONDecodeError:
+                payload = joined
+        else:
+            payload = None
+        events.append({"event": event_type, "data": payload})
+    return events
+
+
+async def _post_json(
+    client: httpx.AsyncClient,
+    base_url: str,
+    headers: Dict[str, str],
+    payload: Dict[str, Any],
+) -> tuple[httpx.Response, Any]:
+    response = await client.post(
+        f"{base_url}/v1/messages", headers=headers, json=payload
+    )
+    body: Any
+    try:
+        body = response.json()
+    except json.JSONDecodeError:
+        body = response.text
+    return response, body
+
+
+async def _post_stream(
+    client: httpx.AsyncClient,
+    base_url: str,
+    headers: Dict[str, str],
+    payload: Dict[str, Any],
+) -> tuple[httpx.Response, List[Dict[str, Any]], str]:
+    async with client.stream(
+        "POST", f"{base_url}/v1/messages", headers=headers, json=payload
+    ) as response:
+        raw_text = await response.aread()
+        decoded = raw_text.decode("utf-8", errors="replace")
+        return response, _parse_sse_events(decoded), decoded
+
+
+async def probe_nonstream_stop_sequence(
+    client: httpx.AsyncClient, base_url: str, headers: Dict[str, str], model: str
+) -> ProbeResult:
+    payload = {
+        "model": model,
+        "max_tokens": 128,
+        "stop_sequences": ["BBB"],
+        "messages": [{"role": "user", "content": "Reply exactly with: AAA BBB CCC"}],
+    }
+    response, body = await _post_json(client, base_url, headers, payload)
+    if response.status_code != 200 or not isinstance(body, dict):
+        return ProbeResult(
+            name="nonstream_stop_sequence",
+            ok=False,
+            detail=f"unexpected response: status={response.status_code}",
+            status_code=response.status_code,
+            response_headers=_interesting_headers(response.headers),
+        )
+
+    text = _extract_text_blocks(body.get("content"))
+    ok = (
+        body.get("stop_reason") == "stop_sequence"
+        and body.get("stop_sequence") == "BBB"
+        and text == "AAA "
+        and response.headers.get("x-kiro-gateway-local-stop-control") == "stop_sequence"
+    )
+    return ProbeResult(
+        name="nonstream_stop_sequence",
+        ok=ok,
+        detail=(
+            f"stop_reason={body.get('stop_reason')}, "
+            f"stop_sequence={body.get('stop_sequence')}, text={text!r}"
+        ),
+        status_code=response.status_code,
+        response_headers=_interesting_headers(response.headers),
+    )
+
+
+async def probe_nonstream_max_tokens(
+    client: httpx.AsyncClient, base_url: str, headers: Dict[str, str], model: str
+) -> ProbeResult:
+    payload = {
+        "model": model,
+        "max_tokens": 8,
+        "messages": [
+            {
+                "role": "user",
+                "content": "Repeat the word TOKEN exactly 50 times separated by spaces and nothing else.",
+            }
+        ],
+    }
+    response, body = await _post_json(client, base_url, headers, payload)
+    if response.status_code != 200 or not isinstance(body, dict):
+        return ProbeResult(
+            name="nonstream_max_tokens",
+            ok=False,
+            detail=f"unexpected response: status={response.status_code}",
+            status_code=response.status_code,
+            response_headers=_interesting_headers(response.headers),
+        )
+
+    usage = body.get("usage") or {}
+    ok = (
+        body.get("stop_reason") == "max_tokens"
+        and response.headers.get("x-kiro-gateway-local-stop-control") == "max_tokens"
+        and isinstance(usage.get("output_tokens"), int)
+        and usage.get("output_tokens") <= 8
+    )
+    return ProbeResult(
+        name="nonstream_max_tokens",
+        ok=ok,
+        detail=(
+            f"stop_reason={body.get('stop_reason')}, "
+            f"output_tokens={usage.get('output_tokens')}"
+        ),
+        status_code=response.status_code,
+        response_headers=_interesting_headers(response.headers),
+    )
+
+
+async def probe_stream_stop_sequence(
+    client: httpx.AsyncClient, base_url: str, headers: Dict[str, str], model: str
+) -> ProbeResult:
+    payload = {
+        "model": model,
+        "stream": True,
+        "max_tokens": 128,
+        "stop_sequences": ["STOP"],
+        "messages": [{"role": "user", "content": "Reply exactly with: AAA STOP CCC"}],
+    }
+    response, events, _ = await _post_stream(client, base_url, headers, payload)
+    text = "".join(
+        event["data"]["delta"].get("text", "")
+        for event in events
+        if event.get("event") == "content_block_delta"
+        and isinstance(event.get("data"), dict)
+        and isinstance(event["data"].get("delta"), dict)
+    )
+    message_delta = next(
+        (
+            event.get("data")
+            for event in events
+            if event.get("event") == "message_delta"
+            and isinstance(event.get("data"), dict)
+        ),
+        {},
+    )
+    delta = message_delta.get("delta") or {}
+    ok = (
+        response.status_code == 200
+        and delta.get("stop_reason") == "stop_sequence"
+        and delta.get("stop_sequence") == "STOP"
+        and text == "AAA "
+    )
+    return ProbeResult(
+        name="stream_stop_sequence",
+        ok=ok,
+        detail=(
+            f"stop_reason={delta.get('stop_reason')}, "
+            f"stop_sequence={delta.get('stop_sequence')}, text={text!r}"
+        ),
+        status_code=response.status_code,
+        response_headers=_interesting_headers(response.headers),
+    )
+
+
+async def probe_stream_max_tokens(
+    client: httpx.AsyncClient, base_url: str, headers: Dict[str, str], model: str
+) -> ProbeResult:
+    payload = {
+        "model": model,
+        "stream": True,
+        "max_tokens": 8,
+        "messages": [
+            {
+                "role": "user",
+                "content": "Repeat the word TOKEN exactly 50 times separated by spaces and nothing else.",
+            }
+        ],
+    }
+    response, events, _ = await _post_stream(client, base_url, headers, payload)
+    message_delta = next(
+        (
+            event.get("data")
+            for event in events
+            if event.get("event") == "message_delta"
+            and isinstance(event.get("data"), dict)
+        ),
+        {},
+    )
+    delta = message_delta.get("delta") or {}
+    usage = message_delta.get("usage") or {}
+    ok = (
+        response.status_code == 200
+        and delta.get("stop_reason") == "max_tokens"
+        and isinstance(usage.get("output_tokens"), int)
+        and usage.get("output_tokens") <= 8
+    )
+    return ProbeResult(
+        name="stream_max_tokens",
+        ok=ok,
+        detail=(
+            f"stop_reason={delta.get('stop_reason')}, "
+            f"output_tokens={usage.get('output_tokens')}"
+        ),
+        status_code=response.status_code,
+        response_headers=_interesting_headers(response.headers),
+    )
+
+
+async def probe_tool_bypass(
+    client: httpx.AsyncClient, base_url: str, headers: Dict[str, str], model: str
+) -> ProbeResult:
+    payload = {
+        "model": model,
+        "max_tokens": 64,
+        "tools": [
+            {
+                "name": "echo_args",
+                "description": "Echo the provided text",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                },
+            }
+        ],
+        "messages": [{"role": "user", "content": "Say OK"}],
+    }
+    response, body = await _post_json(client, base_url, headers, payload)
+    ok = (
+        response.status_code == 200
+        and response.headers.get("x-kiro-gateway-local-text-controls") == "bypass_tools"
+        and isinstance(body, dict)
+    )
+    return ProbeResult(
+        name="tool_bypass",
+        ok=ok,
+        detail=(
+            "local_text_controls="
+            f"{response.headers.get('x-kiro-gateway-local-text-controls')}"
+        ),
+        status_code=response.status_code,
+        response_headers=_interesting_headers(response.headers),
+    )
+
+
+async def run_probes(
+    base_url: str, api_key: str, model: str, timeout_seconds: float
+) -> List[ProbeResult]:
+    headers = _build_headers(api_key)
+    async with httpx.AsyncClient(
+        timeout=timeout_seconds, follow_redirects=True
+    ) as client:
+        return [
+            await probe_nonstream_stop_sequence(client, base_url, headers, model),
+            await probe_nonstream_max_tokens(client, base_url, headers, model),
+            await probe_stream_stop_sequence(client, base_url, headers, model),
+            await probe_stream_max_tokens(client, base_url, headers, model),
+            await probe_tool_bypass(client, base_url, headers, model),
+        ]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Probe live Anthropic compatibility.")
+    parser.add_argument(
+        "--base-url", required=True, help="Gateway base URL, e.g. https://host/kiro"
+    )
+    parser.add_argument(
+        "--api-key",
+        default=os.getenv("KIRO_GATEWAY_API_KEY") or os.getenv("PROXY_API_KEY"),
+        help="Gateway API key. Defaults to KIRO_GATEWAY_API_KEY or PROXY_API_KEY.",
+    )
+    parser.add_argument(
+        "--model", default=DEFAULT_MODEL, help=f"Model name. Default: {DEFAULT_MODEL}"
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=60.0, help="Request timeout in seconds."
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON."
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if not args.api_key:
+        print(
+            "Missing API key. Use --api-key or set KIRO_GATEWAY_API_KEY/PROXY_API_KEY.",
+            file=sys.stderr,
+        )
+        return 2
+
+    results = asyncio.run(
+        run_probes(
+            base_url=_normalize_base_url(args.base_url),
+            api_key=args.api_key,
+            model=args.model,
+            timeout_seconds=args.timeout,
+        )
+    )
+
+    if args.json:
+        print(
+            json.dumps(
+                [
+                    {
+                        "name": result.name,
+                        "ok": result.ok,
+                        "detail": result.detail,
+                        "status_code": result.status_code,
+                        "response_headers": result.response_headers or {},
+                    }
+                    for result in results
+                ],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        for result in results:
+            status = "PASS" if result.ok else "FAIL"
+            print(f"[{status}] {result.name}: {result.detail}")
+            if result.response_headers:
+                for key, value in sorted(result.response_headers.items()):
+                    print(f"    {key}: {value}")
+
+    return 0 if all(result.ok for result in results) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1563,7 +1563,9 @@ class TestAnthropicToKiro:
             "userInputMessage"
         ]["content"]
         print(f"Current content: {current_content}")
+        assert "<system_prompt>" in current_content
         assert "You are a helpful assistant." in current_content
+        assert "</system_prompt>" in current_content
 
     def test_includes_tools(self):
         """

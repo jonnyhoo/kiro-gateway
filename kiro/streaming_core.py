@@ -122,6 +122,8 @@ class StreamResult:
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
+    stream_completed_normally: bool = False
+    content_was_truncated: bool = False
 
 
 class FirstTokenTimeoutError(Exception):
@@ -388,6 +390,13 @@ async def collect_stream_to_result(
         result.tool_calls = deduplicate_tool_calls(
             result.tool_calls + bracket_tool_calls
         )
+
+    result.stream_completed_normally = result.context_usage_percentage is not None
+    result.content_was_truncated = (
+        not result.stream_completed_normally
+        and len(result.content) > 0
+        and not result.tool_calls
+    )
 
     return result
 

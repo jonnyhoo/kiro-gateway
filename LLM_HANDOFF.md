@@ -57,6 +57,15 @@ The gateway already includes:
 - Redis Anthropic prompt-cache compatibility/accounting
 - Anthropic message-level `cache_control` preservation
 - Tool docs no longer mirrored into forwarded system prompt
+- Non-streaming Anthropic plain-text responses now enforce `stop_sequences` locally
+- Non-streaming Anthropic plain-text responses now enforce `max_tokens` locally
+- Streaming Anthropic text-only responses now enforce `stop_sequences` locally
+- Streaming Anthropic text-only responses now enforce `max_tokens` locally
+- Flattened system prompts are now wrapped in `<system_prompt>...</system_prompt>`
+- Anthropic responses now expose local-output telemetry headers:
+  `x-kiro-gateway-local-text-controls`
+  `x-kiro-gateway-local-stop-control`
+  `x-kiro-gateway-content-truncation`
 
 The deployment layout was then cleaned up so the server git worktree stays clean:
 
@@ -78,6 +87,12 @@ The deployment layout was then cleaned up so the server git worktree stays clean
    `kiro/routes_anthropic.py`
    `kiro/tool_result_cache.py`
    `kiro/response_cache.py`
+6. If working on Anthropic response compatibility:
+   `kiro/streaming_anthropic.py`
+   `kiro/streaming_core.py`
+   `kiro/converters_core.py`
+7. If validating a live gateway endpoint:
+   `scripts/ops/probe_anthropic_compat.py`
 
 ## Deployment Model
 
@@ -140,6 +155,13 @@ curl http://127.0.0.1:8000/health
 curl https://api.10010074.xyz/kiro/health
 ```
 
+Probe Anthropic compatibility on a live endpoint:
+
+```bash
+cd E:\VIBE_CODING_WORK\kiro-gateway
+python scripts/ops/probe_anthropic_compat.py --base-url https://api.10010074.xyz/kiro --api-key <key>
+```
+
 ## Sync Workflow
 
 Use this when local contains the intended commit:
@@ -198,6 +220,22 @@ Do not casually break these:
 - Keep tool-result cache scope-aware; never reuse across unrelated workspace/session scope
 - Do not warm prompt-cache accounting on exact response-cache hits
 - Before declaring "synced", verify all four ends, not just git push success
+- Do not "fix" Anthropic compatibility by weakening tool-use behavior; prefer
+  response-side constraints for plain-text replies
+- Preserve `_kiro_gateway_meta` as an internal-only field; routes must strip it
+  before returning JSON to clients
+
+## Remaining Gaps
+
+These were still open after the latest local compatibility pass:
+
+- Streaming plain-text truncation is only detected/logged; user-facing handling is
+  still undecided
+- Anthropic local streaming output controls are intentionally limited to
+  text-only requests; tool-enabled requests still bypass them to avoid degrading
+  tool use
+- Anthropic `system` is still embedded into user-visible Kiro content because
+  Kiro has no native system field; the gateway now only adds XML boundaries
 
 ## Server Facts Verified On 2026-03-07
 

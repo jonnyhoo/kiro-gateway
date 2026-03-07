@@ -112,6 +112,7 @@ docker compose ps
 docker compose logs --tail=100
 docker compose config
 curl http://127.0.0.1:8000/health
+python scripts/ops/probe_anthropic_compat.py --base-url https://api.10010074.xyz/kiro --api-key <key>
 ```
 
 Debug files are stored under `runtime/debug_logs/` when `DEBUG_MODE` is enabled.

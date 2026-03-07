@@ -332,6 +332,21 @@ def get_truncation_recovery_system_addition() -> str:
     )
 
 
+def format_embedded_system_prompt(system_prompt: str) -> str:
+    """
+    Wrap an external system prompt so Kiro sees a clear boundary from user text.
+
+    Kiro has no native system field, so the gateway must embed system content into
+    a user message. Lightweight XML tags keep the boundary explicit without adding
+    more behavioral instructions than necessary.
+    """
+    cleaned = (system_prompt or "").strip()
+    if not cleaned:
+        return ""
+
+    return f"<system_prompt>\n{cleaned}\n</system_prompt>"
+
+
 def inject_thinking_tags(content: str) -> str:
     """
     Inject fake reasoning tags into content.
@@ -1450,6 +1465,7 @@ def build_kiro_payload(
             if full_system_prompt
             else truncation_system_addition.strip()
         )
+    embedded_system_prompt = format_embedded_system_prompt(full_system_prompt)
 
     # If no tools are defined, strip ALL tool-related content from messages
     # Kiro API rejects requests with toolResults but no tools
@@ -1486,11 +1502,11 @@ def build_kiro_payload(
     history_messages = merged_messages[:-1] if len(merged_messages) > 1 else []
 
     # If there's a system prompt, add it to the first user message in history
-    if full_system_prompt and history_messages:
+    if embedded_system_prompt and history_messages:
         first_msg = history_messages[0]
         if first_msg.role == "user":
             original_content = extract_text_content(first_msg.content)
-            first_msg.content = f"{full_system_prompt}\n\n{original_content}"
+            first_msg.content = f"{embedded_system_prompt}\n\n{original_content}"
 
     history = build_kiro_history(history_messages, model_id)
 
@@ -1499,8 +1515,8 @@ def build_kiro_payload(
     current_content = extract_text_content(current_message.content)
 
     # If system prompt exists but history is empty - add to current message
-    if full_system_prompt and not history:
-        current_content = f"{full_system_prompt}\n\n{current_content}"
+    if embedded_system_prompt and not history:
+        current_content = f"{embedded_system_prompt}\n\n{current_content}"
 
     # If current message is assistant, need to add it to history
     # and create user message "Continue"
