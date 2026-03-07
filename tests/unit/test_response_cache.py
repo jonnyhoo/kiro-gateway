@@ -18,6 +18,18 @@ from kiro.tool_result_cache import (
 )
 
 
+class FakeToolCacheRedis:
+    def __init__(self):
+        self.storage = {}
+
+    async def get(self, key):
+        return self.storage.get(key)
+
+    async def set(self, key, value, ex=None):
+        self.storage[key] = value
+        return True
+
+
 class TestOpenAICacheEligibility:
     """Tests for OpenAI exact cache eligibility checks."""
 
@@ -304,7 +316,7 @@ class TestRedisToolResultCache:
 
     @patch("kiro.tool_result_cache.redis_asyncio.from_url")
     @pytest.mark.asyncio
-    async def test_observe_openai_messages_miss_then_hit(self, mock_from_url):
+    async def test_observe_openai_messages_requires_scope(self, mock_from_url):
         mock_client = AsyncMock()
         mock_client.get.side_effect = [None, '{"content":"file content"}']
         mock_from_url.return_value = mock_client
@@ -338,10 +350,99 @@ class TestRedisToolResultCache:
         ]
 
         first = await cache.observe_openai_messages(messages)
-        second = await cache.observe_openai_messages(messages)
+
+        assert first == "bypass"
+
+    @patch("kiro.tool_result_cache.redis_asyncio.from_url")
+    @pytest.mark.asyncio
+    async def test_observe_openai_messages_miss_then_hit_with_scope(
+        self, mock_from_url
+    ):
+        mock_client = AsyncMock()
+        mock_client.get.side_effect = [None, '{"content":"file content"}']
+        mock_from_url.return_value = mock_client
+
+        cache = RedisToolResultCache(
+            redis_url="redis://localhost:6379/0",
+            ttl_seconds=300,
+            key_prefix="test-tool-cache",
+        )
+        await cache.connect()
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": {"path": "README.md"},
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "file content",
+            },
+        ]
+
+        first = await cache.observe_openai_messages(
+            messages, scope={"user": "session-a"}
+        )
+        second = await cache.observe_openai_messages(
+            messages, scope={"user": "session-a"}
+        )
 
         assert first == "miss"
         assert second == "hit"
+
+    @pytest.mark.asyncio
+    async def test_tool_result_cache_isolated_by_scope(self):
+        cache = RedisToolResultCache(
+            redis_url="redis://localhost:6379/0",
+            ttl_seconds=300,
+            key_prefix="test-tool-cache",
+        )
+        cache.client = FakeToolCacheRedis()
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": {"path": "README.md"},
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "file content",
+            },
+        ]
+
+        first = await cache.observe_openai_messages(
+            messages, scope={"user": "session-a", "workspace_id": "repo-a"}
+        )
+        second = await cache.observe_openai_messages(
+            messages, scope={"user": "session-a", "workspace_id": "repo-a"}
+        )
+        third = await cache.observe_openai_messages(
+            messages, scope={"user": "session-a", "workspace_id": "repo-b"}
+        )
+
+        assert first == "miss"
+        assert second == "hit"
+        assert third == "miss"
 
     @patch("kiro.tool_result_cache.redis_asyncio.from_url")
     @pytest.mark.asyncio
@@ -378,10 +479,50 @@ class TestRedisToolResultCache:
             ChatMessage(role="tool", tool_call_id="call_1", content=""),
         ]
 
-        hydrated, status = await cache.hydrate_openai_messages(messages)
+        hydrated, status = await cache.hydrate_openai_messages(
+            messages, scope={"user": "session-a"}
+        )
 
         assert status == "reused"
         assert hydrated[1].content == "file content"
+
+    @patch("kiro.tool_result_cache.redis_asyncio.from_url")
+    @pytest.mark.asyncio
+    async def test_hydrate_openai_messages_bypasses_without_scope(self, mock_from_url):
+        mock_client = AsyncMock()
+        mock_client.get.return_value = '{"tool_name":"read_file","arguments":{"path":"README.md"},"content":"file content"}'
+        mock_from_url.return_value = mock_client
+
+        cache = RedisToolResultCache(
+            redis_url="redis://localhost:6379/0",
+            ttl_seconds=300,
+            key_prefix="test-tool-cache",
+        )
+        await cache.connect()
+
+        from kiro.models_openai import ChatMessage
+
+        messages = [
+            ChatMessage(
+                role="assistant",
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": {"path": "README.md"},
+                        },
+                    }
+                ],
+            ),
+            ChatMessage(role="tool", tool_call_id="call_1", content=""),
+        ]
+
+        hydrated, status = await cache.hydrate_openai_messages(messages)
+
+        assert status == "bypass"
+        assert hydrated[1].content == ""
 
     @patch("kiro.tool_result_cache.redis_asyncio.from_url")
     @pytest.mark.asyncio
@@ -422,7 +563,9 @@ class TestRedisToolResultCache:
             },
         ]
 
-        status = await cache.observe_anthropic_messages(messages)
+        status = await cache.observe_anthropic_messages(
+            messages, scope={"user_id": "session-a"}
+        )
         assert status == "bypass"
 
     @patch("kiro.tool_result_cache.redis_asyncio.from_url")
@@ -463,7 +606,9 @@ class TestRedisToolResultCache:
             ),
         ]
 
-        hydrated, status = await cache.hydrate_anthropic_messages(messages)
+        hydrated, status = await cache.hydrate_anthropic_messages(
+            messages, scope={"user_id": "session-a"}
+        )
 
         assert status == "reused"
         tool_result_block = hydrated[1].content[0]

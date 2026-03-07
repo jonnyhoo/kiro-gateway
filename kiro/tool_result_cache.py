@@ -69,6 +69,26 @@ def _normalize_result_content(content: Any) -> str:
     return _json_dumps_canonical(content)
 
 
+def _normalize_scope(scope: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    """Normalize a tool cache scope into a deterministic, non-empty mapping."""
+    if not isinstance(scope, dict):
+        return None
+
+    normalized_scope: Dict[str, str] = {}
+    for key, value in scope.items():
+        if value is None:
+            continue
+
+        key_text = str(key).strip()
+        value_text = str(value).strip()
+        if not key_text or not value_text:
+            continue
+
+        normalized_scope[key_text] = value_text
+
+    return normalized_scope or None
+
+
 def is_probably_read_only_tool(tool_name: str) -> bool:
     """Best-effort heuristic for identifying read-only tool names."""
     normalized = tool_name.lower()
@@ -146,10 +166,13 @@ class RedisToolResultCache:
         finally:
             self.client = None
 
-    def _make_key(self, namespace: str, tool_name: str, arguments: Any) -> str:
+    def _make_key(
+        self, namespace: str, scope: Dict[str, str], tool_name: str, arguments: Any
+    ) -> str:
         digest = hashlib.sha256(
             _json_dumps_canonical(
                 {
+                    "scope": scope,
                     "tool_name": tool_name,
                     "arguments": _normalize_arguments(arguments),
                 }
@@ -158,16 +181,22 @@ class RedisToolResultCache:
         return f"{self.key_prefix}:{namespace}:{digest}"
 
     async def _get_cached_payload(
-        self, namespace: str, tool_name: str, arguments: Any
+        self,
+        namespace: str,
+        scope: Optional[Dict[str, Any]],
+        tool_name: str,
+        arguments: Any,
     ) -> Optional[Dict[str, Any]]:
+        normalized_scope = _normalize_scope(scope)
         if (
             self.client is None
+            or normalized_scope is None
             or not tool_name
             or not is_probably_read_only_tool(tool_name)
         ):
             return None
 
-        key = self._make_key(namespace, tool_name, arguments)
+        key = self._make_key(namespace, normalized_scope, tool_name, arguments)
         try:
             cached = await self.client.get(key)
             return json.loads(cached) if cached else None
@@ -176,17 +205,25 @@ class RedisToolResultCache:
             return None
 
     async def _set_payload(
-        self, namespace: str, tool_name: str, arguments: Any, content: Any
+        self,
+        namespace: str,
+        scope: Optional[Dict[str, Any]],
+        tool_name: str,
+        arguments: Any,
+        content: Any,
     ) -> bool:
+        normalized_scope = _normalize_scope(scope)
         if (
             self.client is None
+            or normalized_scope is None
             or not tool_name
             or not is_probably_read_only_tool(tool_name)
         ):
             return False
 
-        key = self._make_key(namespace, tool_name, arguments)
+        key = self._make_key(namespace, normalized_scope, tool_name, arguments)
         payload = {
+            "scope": normalized_scope,
             "tool_name": tool_name,
             "arguments": arguments,
             "content": content,
@@ -202,9 +239,17 @@ class RedisToolResultCache:
             return False
 
     async def _observe(
-        self, namespace: str, tool_name: str, arguments: Any, content: Any
+        self,
+        namespace: str,
+        scope: Optional[Dict[str, Any]],
+        tool_name: str,
+        arguments: Any,
+        content: Any,
     ) -> str:
         if self.client is None:
+            return "bypass"
+
+        if _normalize_scope(scope) is None:
             return "bypass"
 
         if not tool_name or not is_probably_read_only_tool(tool_name):
@@ -214,8 +259,10 @@ class RedisToolResultCache:
             return "bypass"
 
         normalized_content = _normalize_result_content(content)
-        cached_payload = await self._get_cached_payload(namespace, tool_name, arguments)
-        await self._set_payload(namespace, tool_name, arguments, content)
+        cached_payload = await self._get_cached_payload(
+            namespace, scope, tool_name, arguments
+        )
+        await self._set_payload(namespace, scope, tool_name, arguments, content)
 
         if (
             cached_payload
@@ -238,10 +285,11 @@ class RedisToolResultCache:
         return False
 
     async def hydrate_openai_messages(
-        self, messages: List[Any]
+        self, messages: List[Any], scope: Optional[Dict[str, Any]] = None
     ) -> Tuple[List[Any], str]:
         """Hydrate empty read-only OpenAI tool results from Redis when possible."""
-        if not messages:
+        normalized_scope = _normalize_scope(scope)
+        if not messages or normalized_scope is None:
             return messages, "bypass"
 
         tool_calls: Dict[str, Dict[str, Any]] = {}
@@ -272,7 +320,7 @@ class RedisToolResultCache:
 
                 current_content = getattr(msg, "content", None)
                 cached_payload = await self._get_cached_payload(
-                    "openai", metadata["name"], metadata["arguments"]
+                    "openai", normalized_scope, metadata["name"], metadata["arguments"]
                 )
 
                 if (
@@ -290,6 +338,7 @@ class RedisToolResultCache:
                 statuses.append(
                     await self._observe(
                         "openai",
+                        normalized_scope,
                         metadata["name"],
                         metadata["arguments"],
                         current_content,
@@ -303,10 +352,11 @@ class RedisToolResultCache:
         return modified_messages, summarize_tool_cache_status(statuses)
 
     async def hydrate_anthropic_messages(
-        self, messages: List[Any]
+        self, messages: List[Any], scope: Optional[Dict[str, Any]] = None
     ) -> Tuple[List[Any], str]:
         """Hydrate empty read-only Anthropic tool results from Redis when possible."""
-        if not messages:
+        normalized_scope = _normalize_scope(scope)
+        if not messages or normalized_scope is None:
             return messages, "bypass"
 
         tool_uses: Dict[str, Dict[str, Any]] = {}
@@ -389,7 +439,10 @@ class RedisToolResultCache:
                     else getattr(block, "content", None)
                 )
                 cached_payload = await self._get_cached_payload(
-                    "anthropic", metadata["name"], metadata["arguments"]
+                    "anthropic",
+                    normalized_scope,
+                    metadata["name"],
+                    metadata["arguments"],
                 )
 
                 if (
@@ -411,6 +464,7 @@ class RedisToolResultCache:
                 statuses.append(
                     await self._observe(
                         "anthropic",
+                        normalized_scope,
                         metadata["name"],
                         metadata["arguments"],
                         current_content,
@@ -427,8 +481,14 @@ class RedisToolResultCache:
 
         return modified_messages, summarize_tool_cache_status(statuses)
 
-    async def observe_openai_messages(self, messages: List[Dict[str, Any]]) -> str:
+    async def observe_openai_messages(
+        self, messages: List[Dict[str, Any]], scope: Optional[Dict[str, Any]] = None
+    ) -> str:
         """Observe OpenAI tool exchanges and cache read-only tool results."""
+        normalized_scope = _normalize_scope(scope)
+        if normalized_scope is None:
+            return "bypass"
+
         tool_calls: Dict[str, Dict[str, Any]] = {}
         statuses: List[str] = []
 
@@ -457,6 +517,7 @@ class RedisToolResultCache:
                 statuses.append(
                     await self._observe(
                         namespace="openai",
+                        scope=normalized_scope,
                         tool_name=metadata["name"],
                         arguments=metadata["arguments"],
                         content=msg.get("content", ""),
@@ -465,8 +526,14 @@ class RedisToolResultCache:
 
         return summarize_tool_cache_status(statuses)
 
-    async def observe_anthropic_messages(self, messages: List[Dict[str, Any]]) -> str:
+    async def observe_anthropic_messages(
+        self, messages: List[Dict[str, Any]], scope: Optional[Dict[str, Any]] = None
+    ) -> str:
         """Observe Anthropic tool exchanges and cache read-only tool results."""
+        normalized_scope = _normalize_scope(scope)
+        if normalized_scope is None:
+            return "bypass"
+
         tool_uses: Dict[str, Dict[str, Any]] = {}
         statuses: List[str] = []
 
@@ -501,6 +568,7 @@ class RedisToolResultCache:
                     statuses.append(
                         await self._observe(
                             namespace="anthropic",
+                            scope=normalized_scope,
                             tool_name=metadata["name"],
                             arguments=metadata["arguments"],
                             content=block.get("content", ""),

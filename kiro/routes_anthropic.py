@@ -43,6 +43,7 @@ from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.converters_anthropic import anthropic_to_kiro, extract_system_prompt
 from kiro.prompt_cache import (
+    build_prompt_cache_usage,
     empty_prompt_cache_evaluation,
     summarize_prompt_cache_normalization,
     summarize_prompt_cache_segments,
@@ -225,6 +226,57 @@ def _build_prompt_cache_headers(
             prompt_cache_segments
         ),
     }
+
+
+def _build_tool_cache_scope(
+    request_payload: dict, auth_manager: KiroAuthManager
+) -> Optional[dict[str, str]]:
+    """Build a conservative tool-result cache scope for safe reuse."""
+    metadata = request_payload.get("metadata")
+    scope: dict[str, str] = {}
+
+    if auth_manager.profile_arn:
+        scope["profile_arn"] = auth_manager.profile_arn
+    elif auth_manager.api_host:
+        scope["api_host"] = auth_manager.api_host
+
+    if isinstance(metadata, dict):
+        for key in (
+            "user_id",
+            "session_id",
+            "workspace_id",
+            "cwd",
+            "working_directory",
+            "repo",
+            "repository",
+            "project",
+            "project_root",
+        ):
+            value = metadata.get(key)
+            if value is not None and str(value).strip():
+                scope[key] = str(value).strip()
+
+    for key in (
+        "session_id",
+        "workspace_id",
+        "cwd",
+        "working_directory",
+        "repo",
+        "repository",
+        "project",
+        "project_root",
+        "user",
+    ):
+        value = request_payload.get(key)
+        if value is not None and str(value).strip():
+            scope[key] = str(value).strip()
+
+    meaningful_scope = {
+        key: value
+        for key, value in scope.items()
+        if key not in ("profile_arn", "api_host")
+    }
+    return scope if meaningful_scope else None
 
 
 # --- Router ---
@@ -432,27 +484,29 @@ async def messages(
     prompt_cache = getattr(request.app.state, "prompt_cache", None)
     tool_result_cache = request.app.state.tool_result_cache
     cache_status = "bypass"
+    request_payload = request_data.model_dump(exclude_none=True)
+    tool_cache_scope = _build_tool_cache_scope(request_payload, auth_manager)
     (
         request_data.messages,
         tool_cache_status,
-    ) = await tool_result_cache.hydrate_anthropic_messages(request_data.messages)
-    cache_payload = request_data.model_dump(exclude_none=True)
-    (
-        prompt_cache_usage,
-        prompt_cache_status,
-        prompt_cache_segments,
-        prompt_cache_source,
-    ) = await _evaluate_prompt_cache(
-        prompt_cache,
-        cache_payload,
+    ) = await tool_result_cache.hydrate_anthropic_messages(
+        request_data.messages, scope=tool_cache_scope
     )
+    cache_payload = request_data.model_dump(exclude_none=True)
+    prompt_cache_usage = build_prompt_cache_usage(0, 0, 0, 0)
+    prompt_cache_status = "bypass"
+    prompt_cache_segments = []
+    prompt_cache_source = "bypass"
     prompt_cache_headers = _build_prompt_cache_headers(
         prompt_cache_status,
         prompt_cache_usage,
         prompt_cache_segments,
         prompt_cache_source,
     )
-    cacheable, cache_reason = get_anthropic_cache_eligibility(cache_payload)
+    (
+        cacheable,
+        cache_reason,
+    ) = get_anthropic_cache_eligibility(cache_payload)
 
     if not request_data.stream:
         if cacheable and response_cache.is_available():
@@ -480,6 +534,22 @@ async def messages(
             cache_status = "miss"
         else:
             logger.debug(f"Response cache bypass for /v1/messages: {cache_reason}")
+
+    (
+        prompt_cache_usage,
+        prompt_cache_status,
+        prompt_cache_segments,
+        prompt_cache_source,
+    ) = await _evaluate_prompt_cache(
+        prompt_cache,
+        cache_payload,
+    )
+    prompt_cache_headers = _build_prompt_cache_headers(
+        prompt_cache_status,
+        prompt_cache_usage,
+        prompt_cache_segments,
+        prompt_cache_source,
+    )
 
     # Generate conversation ID for Kiro API (random UUID, not used for tracking)
     conversation_id = generate_conversation_id()

@@ -997,7 +997,7 @@ class TestOpenAIExactResponseCache:
 
         tool_result_cache = MagicMock()
         tool_result_cache.hydrate_openai_messages = AsyncMock(
-            side_effect=lambda messages: (messages, "bypass")
+            side_effect=lambda messages, scope=None: (messages, "bypass")
         )
         test_client.app.state.tool_result_cache = tool_result_cache
 
@@ -1037,7 +1037,7 @@ class TestOpenAIExactResponseCache:
 
         tool_result_cache = MagicMock()
         tool_result_cache.hydrate_openai_messages = AsyncMock(
-            side_effect=lambda messages: (messages, "bypass")
+            side_effect=lambda messages, scope=None: (messages, "bypass")
         )
         test_client.app.state.tool_result_cache = tool_result_cache
 
@@ -1093,7 +1093,7 @@ class TestOpenAIExactResponseCache:
 
         tool_result_cache = MagicMock()
         tool_result_cache.hydrate_openai_messages = AsyncMock(
-            side_effect=lambda messages: (messages, "hit")
+            side_effect=lambda messages, scope=None: (messages, "hit")
         )
         test_client.app.state.tool_result_cache = tool_result_cache
 

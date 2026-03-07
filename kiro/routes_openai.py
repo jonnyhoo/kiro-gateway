@@ -27,6 +27,7 @@ Contains all API endpoints:
 """
 
 import json
+from typing import Optional
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Security
@@ -60,6 +61,57 @@ try:
     from kiro.debug_logger import debug_logger
 except ImportError:
     debug_logger = None
+
+
+def _build_tool_cache_scope(
+    request_payload: dict, auth_manager: KiroAuthManager
+) -> Optional[dict[str, str]]:
+    """Build a conservative tool-result cache scope for safe reuse."""
+    scope: dict[str, str] = {}
+    metadata = request_payload.get("metadata")
+
+    if auth_manager.profile_arn:
+        scope["profile_arn"] = auth_manager.profile_arn
+    elif auth_manager.api_host:
+        scope["api_host"] = auth_manager.api_host
+
+    if isinstance(metadata, dict):
+        for key in (
+            "user_id",
+            "session_id",
+            "workspace_id",
+            "cwd",
+            "working_directory",
+            "repo",
+            "repository",
+            "project",
+            "project_root",
+        ):
+            value = metadata.get(key)
+            if value is not None and str(value).strip():
+                scope[key] = str(value).strip()
+
+    for key in (
+        "user",
+        "session_id",
+        "workspace_id",
+        "cwd",
+        "working_directory",
+        "repo",
+        "repository",
+        "project",
+        "project_root",
+    ):
+        value = request_payload.get(key)
+        if value is not None and str(value).strip():
+            scope[key] = str(value).strip()
+
+    meaningful_scope = {
+        key: value
+        for key, value in scope.items()
+        if key not in ("profile_arn", "api_host")
+    }
+    return scope if meaningful_scope else None
 
 
 # --- Security scheme ---
@@ -247,10 +299,14 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
     response_cache = request.app.state.response_cache
     tool_result_cache = request.app.state.tool_result_cache
     cache_status = "bypass"
+    request_payload = request_data.model_dump(exclude_none=True)
+    tool_cache_scope = _build_tool_cache_scope(request_payload, auth_manager)
     (
         request_data.messages,
         tool_cache_status,
-    ) = await tool_result_cache.hydrate_openai_messages(request_data.messages)
+    ) = await tool_result_cache.hydrate_openai_messages(
+        request_data.messages, scope=tool_cache_scope
+    )
     cache_payload = request_data.model_dump(exclude_none=True)
     cacheable, cache_reason = get_openai_cache_eligibility(cache_payload)
 

@@ -1124,34 +1124,12 @@ class TestAnthropicExactResponseCache:
 
         tool_result_cache = MagicMock()
         tool_result_cache.hydrate_anthropic_messages = AsyncMock(
-            side_effect=lambda messages: (messages, "bypass")
+            side_effect=lambda messages, scope=None: (messages, "bypass")
         )
         test_client.app.state.tool_result_cache = tool_result_cache
 
         prompt_cache = MagicMock()
-        prompt_cache.evaluate_anthropic_request_detailed = AsyncMock(
-            return_value=PromptCacheEvaluation(
-                usage={
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 12,
-                    "cache_creation": {
-                        "ephemeral_5m_input_tokens": 0,
-                        "ephemeral_1h_input_tokens": 0,
-                    },
-                },
-                status="hit",
-                segment_results=[
-                    CacheSegmentResult(
-                        namespace="system",
-                        label="system[0]",
-                        status="hit",
-                        token_count=12,
-                        ttl_seconds=3600,
-                    )
-                ],
-                source="explicit",
-            )
-        )
+        prompt_cache.evaluate_anthropic_request_detailed = AsyncMock()
         test_client.app.state.prompt_cache = prompt_cache
 
         response = test_client.post(
@@ -1185,24 +1163,22 @@ class TestAnthropicExactResponseCache:
 
         assert response.status_code == 200
         assert response.headers["x-kiro-gateway-cache"] == "hit"
-        assert response.headers["x-kiro-gateway-prompt-cache"] == "hit"
-        assert response.headers["x-kiro-gateway-prompt-cache-source"] == "explicit"
-        assert (
-            response.headers["x-kiro-gateway-prompt-cache-segments"]
-            == "system[0]:hit:1h:12"
-        )
+        assert response.headers["x-kiro-gateway-prompt-cache"] == "bypass"
+        assert response.headers["x-kiro-gateway-prompt-cache-source"] == "bypass"
+        assert response.headers["x-kiro-gateway-prompt-cache-segments"] == "none"
         assert (
             response.headers["x-kiro-gateway-prompt-cache-tokens"]
-            == "read=12;create=0;5m=0;1h=0"
+            == "read=0;create=0;5m=0;1h=0"
         )
         assert response.headers["x-kiro-gateway-prompt-cache-volatility"] == "none"
         assert response.headers["x-kiro-gateway-prompt-cache-normalized"] == "none"
         assert response.headers["x-kiro-gateway-tool-cache"] == "bypass"
         assert response.json()["id"] == "msg_cached"
         assert response.json()["usage"]["cache_creation_input_tokens"] == 0
-        assert response.json()["usage"]["cache_read_input_tokens"] == 12
+        assert response.json()["usage"]["cache_read_input_tokens"] == 0
         assert not mock_kiro_http_client_class.called
         mock_cache.set_json.assert_not_called()
+        prompt_cache.evaluate_anthropic_request_detailed.assert_not_called()
 
     @patch("kiro.routes_anthropic.collect_anthropic_response", new_callable=AsyncMock)
     @patch("kiro.routes_anthropic.KiroHttpClient")
@@ -1223,7 +1199,7 @@ class TestAnthropicExactResponseCache:
 
         tool_result_cache = MagicMock()
         tool_result_cache.hydrate_anthropic_messages = AsyncMock(
-            side_effect=lambda messages: (messages, "bypass")
+            side_effect=lambda messages, scope=None: (messages, "bypass")
         )
         test_client.app.state.tool_result_cache = tool_result_cache
 
@@ -1281,7 +1257,7 @@ class TestAnthropicExactResponseCache:
 
         tool_result_cache = MagicMock()
         tool_result_cache.hydrate_anthropic_messages = AsyncMock(
-            side_effect=lambda messages: (messages, "hit")
+            side_effect=lambda messages, scope=None: (messages, "hit")
         )
         test_client.app.state.tool_result_cache = tool_result_cache
 
@@ -1374,7 +1350,7 @@ class TestAnthropicExactResponseCache:
 
         tool_result_cache = MagicMock()
         tool_result_cache.hydrate_anthropic_messages = AsyncMock(
-            side_effect=lambda messages: (messages, "bypass")
+            side_effect=lambda messages, scope=None: (messages, "bypass")
         )
         test_client.app.state.tool_result_cache = tool_result_cache
 
@@ -1461,7 +1437,7 @@ class TestAnthropicExactResponseCache:
 
         tool_result_cache = MagicMock()
         tool_result_cache.hydrate_anthropic_messages = AsyncMock(
-            side_effect=lambda messages: (messages, "bypass")
+            side_effect=lambda messages, scope=None: (messages, "bypass")
         )
         test_client.app.state.tool_result_cache = tool_result_cache
 
@@ -1609,7 +1585,7 @@ class TestAnthropicExactResponseCache:
 
         tool_result_cache = MagicMock()
         tool_result_cache.hydrate_anthropic_messages = AsyncMock(
-            side_effect=lambda messages: (messages, "bypass")
+            side_effect=lambda messages, scope=None: (messages, "bypass")
         )
         test_client.app.state.tool_result_cache = tool_result_cache
 
