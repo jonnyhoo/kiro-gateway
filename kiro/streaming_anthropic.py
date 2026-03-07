@@ -264,18 +264,23 @@ def _text_looks_incomplete_for_continuation(text: str) -> bool:
         return False
 
     tail = stripped[-1200:]
-    if tail.count("```") % 2 == 1:
-        return True
-    if _count_unescaped_quotes(tail) % 2 == 1:
-        return True
-
-    for opener, closer in (("(", ")"), ("[", "]"), ("{", "}")):
-        if tail.count(opener) > tail.count(closer):
-            return True
-
     last_line = tail.splitlines()[-1].strip()
     if not last_line:
         return False
+
+    if tail.count("```") % 2 == 1 or last_line.count("```") % 2 == 1:
+        return True
+    if (
+        _count_unescaped_quotes(last_line) % 2 == 1
+        or _count_unescaped_quotes(tail) % 2 == 1
+    ):
+        return True
+
+    for opener, closer in (("(", ")"), ("[", "]"), ("{", "}")):
+        if last_line.count(opener) > last_line.count(closer) or tail.count(
+            opener
+        ) > tail.count(closer):
+            return True
 
     if last_line.startswith(
         (
